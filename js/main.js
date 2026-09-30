@@ -1,6 +1,6 @@
 /**
- * Circle Clash - Main Controller
- * Coordinates UI, User Input, Networking, and Game Loop.
+ * AstroClash - Main Controller
+ * Coordinates UI, Asteroids Flight Controls, PeerJS WebRTC Networking, and Match Flow.
  */
 document.addEventListener('DOMContentLoaded', () => {
   // Elements
@@ -42,10 +42,14 @@ document.addEventListener('DOMContentLoaded', () => {
   const hudTimer = document.getElementById('hudTimer');
   const hudRoomBadge = document.getElementById('hudRoomBadge');
   const hudRoomCode = document.getElementById('hudRoomCode');
-  const territoryBar = document.getElementById('territoryBar');
-  const territoryLabels = document.getElementById('territoryLabels');
+  const scoreboardList = document.getElementById('scoreboardList');
   const btnMute = document.getElementById('btnMute');
   const btnExit = document.getElementById('btnExit');
+
+  const btnTouchLeft = document.getElementById('btnTouchLeft');
+  const btnTouchRight = document.getElementById('btnTouchRight');
+  const btnTouchThrust = document.getElementById('btnTouchThrust');
+  const btnTouchFire = document.getElementById('btnTouchFire');
 
   const winnerName = document.getElementById('winnerName');
   const winnerScore = document.getElementById('winnerScore');
@@ -65,15 +69,15 @@ document.addEventListener('DOMContentLoaded', () => {
   let myPlayerId = 'p_' + Math.random().toString(36).substring(2, 8);
   let isSoloMode = false;
   let matchInterval = null;
-  window.isUserHolding = false;
+  let syncInterval = null;
 
   // --- 1. SETUP PALETTE & STORAGE ---
   function initPlayerSetup() {
-    const savedName = localStorage.getItem('circle_clash_name');
-    playerNameInput.value = savedName || ('Player_' + Math.floor(10 + Math.random() * 90));
+    const savedName = localStorage.getItem('astro_clash_name');
+    playerNameInput.value = savedName || ('Pilot_' + Math.floor(10 + Math.random() * 90));
 
     playerNameInput.addEventListener('input', () => {
-      localStorage.setItem('circle_clash_name', playerNameInput.value.trim());
+      localStorage.setItem('astro_clash_name', playerNameInput.value.trim());
     });
 
     colorPicker.innerHTML = '';
@@ -162,7 +166,7 @@ document.addEventListener('DOMContentLoaded', () => {
         tag.className = 'badge-tag';
         tag.style.background = 'rgba(255, 255, 255, 0.15)';
         tag.style.color = '#ccc';
-        tag.textContent = 'BOT';
+        tag.textContent = 'AI';
         right.appendChild(tag);
       }
 
@@ -174,9 +178,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // --- 5. HOSTING ---
   btnCreateRoom.addEventListener('click', async () => {
-    const name = playerNameInput.value.trim() || 'Host';
+    const name = playerNameInput.value.trim() || 'Host Pilot';
     btnCreateRoom.disabled = true;
-    btnCreateRoom.textContent = 'Initializing Room...';
+    btnCreateRoom.textContent = 'Launching Room...';
     window.soundManager.init();
 
     try {
@@ -208,7 +212,7 @@ document.addEventListener('DOMContentLoaded', () => {
       lobbyError.textContent = 'Failed to create room: ' + err.message;
       lobbyError.style.display = 'block';
       btnCreateRoom.disabled = false;
-      btnCreateRoom.textContent = '⚡ Create Room';
+      btnCreateRoom.textContent = '⚡ Launch Flight Room';
     }
   });
 
@@ -245,31 +249,11 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   function setupHostNetworkHandlers() {
-    // Bot events replicate directly to all connected clients
-    game.onBotExpandStart = (botId, x, y) => {
+    // Laser firing hooks
+    game.onFireLaser = (bullet) => {
       window.networkManager.broadcast({
-        type: 'EXPAND_START',
-        playerId: botId,
-        x,
-        y
-      });
-    };
-
-    game.onBotExpandStop = (botId, territory) => {
-      window.networkManager.broadcast({
-        type: 'EXPAND_RELEASE',
-        playerId: botId,
-        territory
-      });
-    };
-
-    game.onPlayerPop = (playerId, x, y, r) => {
-      window.networkManager.broadcast({
-        type: 'PLAYER_POPPED',
-        playerId,
-        x,
-        y,
-        r
+        type: 'REMOTE_LASER_FIRED',
+        bullet
       });
     };
 
@@ -285,7 +269,6 @@ document.addEventListener('DOMContentLoaded', () => {
         type: 'JOIN_ACCEPTED',
         gameState: {
           players: Array.from(game.players.values()),
-          territories: game.territories,
           duration: parseInt(matchDurationSelect.value, 10)
         }
       });
@@ -311,27 +294,27 @@ document.addEventListener('DOMContentLoaded', () => {
       });
     });
 
-    // Client starts expansion
-    window.networkManager.on('EXPAND_START', (msg) => {
-      game.startExpand(msg.playerId, msg.x, msg.y);
-      // Replicate to all other clients
-      window.networkManager.broadcast({
-        type: 'EXPAND_START',
-        playerId: msg.playerId,
-        x: msg.x,
-        y: msg.y
-      }, msg.fromPeerId);
+    // Client sends their updated flight state
+    window.networkManager.on('SHIP_SYNC', (msg) => {
+      const p = game.players.get(msg.id);
+      if (p && !p.isLocal) {
+        p.x = msg.x;
+        p.y = msg.y;
+        p.vx = msg.vx;
+        p.vy = msg.vy;
+        p.angle = msg.angle;
+        p.thrusting = msg.thrusting;
+      }
     });
 
-    // Client releases expansion -> Host authoritatively locks territory
-    window.networkManager.on('REQUEST_RELEASE', (msg) => {
-      const territory = game.releaseExpand(msg.playerId);
-      // Broadcast release event (with territory if successfully claimed) to ALL clients
+    // Client fires a laser
+    window.networkManager.on('CLIENT_FIRE_LASER', (msg) => {
+      game.spawnLaserFromRemote(msg.bullet);
+      // Multicast to all other clients
       window.networkManager.broadcast({
-        type: 'EXPAND_RELEASE',
-        playerId: msg.playerId,
-        territory
-      });
+        type: 'REMOTE_LASER_FIRED',
+        bullet: msg.bullet
+      }, msg.fromPeerId);
     });
   }
 
@@ -344,9 +327,9 @@ document.addEventListener('DOMContentLoaded', () => {
       return;
     }
 
-    const name = playerNameInput.value.trim() || 'Challenger';
+    const name = playerNameInput.value.trim() || 'Pilot Challenger';
     btnJoinRoom.disabled = true;
-    joinStatus.textContent = `Connecting to room ${code}...`;
+    joinStatus.textContent = `Connecting to flight room ${code}...`;
     joinStatus.style.color = 'var(--accent-cyan)';
     window.soundManager.init();
 
@@ -374,7 +357,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
       }
 
-      joinStatus.textContent = 'Connected! Waiting for host to start match...';
+      joinStatus.textContent = 'Connected! Waiting for host to launch battle...';
       setupClientNetworkHandlers();
     } catch (err) {
       console.error(err);
@@ -385,6 +368,14 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   function setupClientNetworkHandlers() {
+    // When client shoots, send to host
+    game.onFireLaser = (bullet) => {
+      window.networkManager.sendToHost({
+        type: 'CLIENT_FIRE_LASER',
+        bullet
+      });
+    };
+
     window.networkManager.on('PLAYER_JOINED', (msg) => {
       game.addOrUpdatePlayer(msg.player);
     });
@@ -398,38 +389,60 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     });
 
-    window.networkManager.on('GAME_START', (msg) => {
+    window.networkManager.on('MATCH_START', (msg) => {
       startMatchSequence(msg.duration);
-    });
-
-    window.networkManager.on('EXPAND_START', (msg) => {
-      if (msg.playerId !== myPlayerId) {
-        game.startExpand(msg.playerId, msg.x, msg.y);
+      if (msg.asteroids) {
+        game.asteroids = msg.asteroids;
       }
     });
 
-    window.networkManager.on('EXPAND_RELEASE', (msg) => {
-      game.stopExpand(msg.playerId);
-      if (msg.territory) {
-        game.claimTerritory(msg.territory);
+    window.networkManager.on('REMOTE_LASER_FIRED', (msg) => {
+      if (msg.bullet && msg.bullet.playerId !== myPlayerId) {
+        game.spawnLaserFromRemote(msg.bullet);
       }
     });
 
-    window.networkManager.on('PLAYER_POPPED', (msg) => {
-      game.popPlayer(msg.playerId, msg.x, msg.y, msg.r);
-      if (msg.playerId === myPlayerId) {
-        window.isUserHolding = false;
+    // Authoritative 25Hz world tick from Host
+    window.networkManager.on('WORLD_TICK', (msg) => {
+      game.timeRemaining = msg.timeRemaining;
+      if (msg.asteroids) {
+        game.asteroids = msg.asteroids;
       }
-    });
 
-    window.networkManager.on('TIME_SYNC', (msg) => {
-      game.timeRemaining = msg.time;
-      if (msg.scores) game.coverageStats = msg.scores;
+      if (msg.players) {
+        for (const p of msg.players) {
+          if (p.id === myPlayerId) {
+            // Local player syncs authoritative score & status
+            const local = game.players.get(myPlayerId);
+            if (local) {
+              local.score = p.score;
+              local.kills = p.kills;
+              local.deaths = p.deaths;
+              local.isAlive = p.isAlive;
+              local.shieldTimer = p.shieldTimer;
+            }
+          } else {
+            // Remote ship or bot syncs full flight status
+            const remote = game.players.get(p.id) || game.addOrUpdatePlayer(p);
+            remote.x = p.x;
+            remote.y = p.y;
+            remote.vx = p.vx;
+            remote.vy = p.vy;
+            remote.angle = p.angle;
+            remote.thrusting = p.thrusting;
+            remote.score = p.score;
+            remote.kills = p.kills;
+            remote.deaths = p.deaths;
+            remote.isAlive = p.isAlive;
+            remote.shieldTimer = p.shieldTimer;
+          }
+        }
+      }
       updateHudDisplay();
     });
 
-    window.networkManager.on('GAME_OVER', (msg) => {
-      concludeMatch(msg.results);
+    window.networkManager.on('MATCH_CONCLUDED', (msg) => {
+      concludeMatch(msg.rankings);
     });
 
     function handleHostDeparture(reason) {
@@ -455,7 +468,7 @@ document.addEventListener('DOMContentLoaded', () => {
     isSoloMode = true;
     window.soundManager.init();
 
-    const name = playerNameInput.value.trim() || 'Player';
+    const name = playerNameInput.value.trim() || 'Ace Pilot';
     game.reset();
     game.players.clear();
 
@@ -469,16 +482,19 @@ document.addEventListener('DOMContentLoaded', () => {
     game.addBot();
     game.addBot();
 
-    hudRoomCode.textContent = 'PRACTICE';
+    hudRoomCode.textContent = 'SOLO';
     startMatchSequence(60);
   });
 
   // --- 8. MATCH SEQUENCE & TIMER ---
   btnStartGame.addEventListener('click', () => {
     const duration = parseInt(matchDurationSelect.value, 10) || 60;
+    game.spawnInitialAsteroids(6);
+
     window.networkManager.broadcast({
-      type: 'GAME_START',
-      duration
+      type: 'MATCH_START',
+      duration,
+      asteroids: game.asteroids
     });
     startMatchSequence(duration);
   });
@@ -494,6 +510,18 @@ document.addEventListener('DOMContentLoaded', () => {
     game.matchDuration = duration;
     game.timeRemaining = duration;
 
+    // Center local player ship and give them a spawn shield
+    const local = game.players.get(myPlayerId);
+    if (local) {
+      local.x = game.V_WIDTH / 2;
+      local.y = game.V_HEIGHT / 2;
+      local.vx = 0;
+      local.vy = 0;
+      local.angle = -Math.PI / 2;
+      local.isAlive = true;
+      local.shieldTimer = 3.0;
+    }
+
     window.soundManager.playBeep(false);
 
     const countdownInterval = setInterval(() => {
@@ -507,10 +535,75 @@ document.addEventListener('DOMContentLoaded', () => {
         game.state = 'PLAYING';
 
         if (isSoloMode || window.networkManager.isHost) {
+          if (game.asteroids.length === 0) {
+            game.spawnInitialAsteroids(6);
+          }
           startHostGameTimer();
+          startHostSyncBroadcast();
+        } else {
+          startClientSyncLoop();
         }
       }
     }, 1000);
+  }
+
+  // Host 25Hz Broadcast Loop
+  function startHostSyncBroadcast() {
+    if (syncInterval) clearInterval(syncInterval);
+    if (isSoloMode) return;
+
+    syncInterval = setInterval(() => {
+      if (game.state !== 'PLAYING') return;
+
+      const playerList = [];
+      for (const p of game.players.values()) {
+        playerList.push({
+          id: p.id,
+          name: p.name,
+          color: p.color,
+          x: Math.round(p.x),
+          y: Math.round(p.y),
+          vx: Math.round(p.vx),
+          vy: Math.round(p.vy),
+          angle: Number(p.angle.toFixed(3)),
+          thrusting: p.thrusting,
+          score: p.score,
+          kills: p.kills,
+          deaths: p.deaths,
+          isAlive: p.isAlive,
+          shieldTimer: Number(p.shieldTimer.toFixed(2))
+        });
+      }
+
+      window.networkManager.broadcast({
+        type: 'WORLD_TICK',
+        timeRemaining: game.timeRemaining,
+        asteroids: game.asteroids,
+        players: playerList
+      });
+    }, 40);
+  }
+
+  // Client 28Hz Local Sync to Host
+  function startClientSyncLoop() {
+    if (syncInterval) clearInterval(syncInterval);
+
+    syncInterval = setInterval(() => {
+      if (game.state !== 'PLAYING') return;
+      const local = game.players.get(myPlayerId);
+      if (!local) return;
+
+      window.networkManager.sendToHost({
+        type: 'SHIP_SYNC',
+        id: myPlayerId,
+        x: Math.round(local.x),
+        y: Math.round(local.y),
+        vx: Math.round(local.vx),
+        vy: Math.round(local.vy),
+        angle: Number(local.angle.toFixed(3)),
+        thrusting: local.thrusting
+      });
+    }, 35);
   }
 
   function startHostGameTimer() {
@@ -522,29 +615,20 @@ document.addEventListener('DOMContentLoaded', () => {
       game.timeRemaining--;
       updateHudDisplay();
 
-      // Host periodically syncs time and scores to clients
-      if (!isSoloMode && window.networkManager && window.networkManager.isHost) {
-        window.networkManager.broadcast({
-          type: 'TIME_SYNC',
-          time: game.timeRemaining,
-          scores: game.coverageStats
-        });
-      }
-
       if (game.timeRemaining <= 0) {
         clearInterval(matchInterval);
-        game.updateCoverage();
+        if (syncInterval) clearInterval(syncInterval);
 
-        const results = computeRankings();
+        const rankings = computeRankings();
 
         if (!isSoloMode && window.networkManager && window.networkManager.isHost) {
           window.networkManager.broadcast({
-            type: 'GAME_OVER',
-            results
+            type: 'MATCH_CONCLUDED',
+            rankings
           });
         }
 
-        concludeMatch(results);
+        concludeMatch(rankings);
       }
     }, 1000);
   }
@@ -552,28 +636,32 @@ document.addEventListener('DOMContentLoaded', () => {
   function computeRankings() {
     const ranking = [];
     for (const player of game.players.values()) {
-      const pct = parseFloat(game.coverageStats[player.id] || 0);
       ranking.push({
         id: player.id,
         name: player.name,
         color: player.color,
-        score: pct
+        score: player.score,
+        kills: player.kills,
+        deaths: player.deaths
       });
     }
-    ranking.sort((a, b) => b.score - a.score);
+    ranking.sort((a, b) => b.score - a.score || b.kills - a.kills);
     return ranking;
   }
 
   function concludeMatch(rankings) {
     game.state = 'GAME_OVER';
     if (matchInterval) clearInterval(matchInterval);
-    window.soundManager.stopAllExpands();
-    window.soundManager.playVictory();
+    if (syncInterval) clearInterval(syncInterval);
+    if (window.soundManager) {
+      window.soundManager.stopThrustSound();
+      window.soundManager.playVictory();
+    }
 
-    const winner = rankings[0] || { name: 'Nobody', color: '#fff', score: 0 };
+    const winner = rankings[0] || { name: 'Nobody', color: '#fff', score: 0, kills: 0 };
     winnerName.textContent = winner.name;
     winnerName.style.color = winner.color;
-    winnerScore.textContent = `Controlled ${winner.score}% of the arena`;
+    winnerScore.textContent = `Score: ${winner.score} • ${winner.kills} Kills`;
 
     leaderboardResults.innerHTML = '';
     rankings.forEach((r, rank) => {
@@ -595,10 +683,22 @@ document.addEventListener('DOMContentLoaded', () => {
       left.appendChild(dot);
       left.appendChild(title);
 
-      const right = document.createElement('span');
-      right.style.fontWeight = '700';
-      right.style.color = r.color;
-      right.textContent = `${r.score}%`;
+      const right = document.createElement('div');
+      right.style.display = 'flex';
+      right.style.gap = '12px';
+
+      const killsSpan = document.createElement('span');
+      killsSpan.style.color = 'var(--text-muted)';
+      killsSpan.style.fontSize = '0.85rem';
+      killsSpan.textContent = `${r.kills} Kills`;
+
+      const scoreSpan = document.createElement('span');
+      scoreSpan.style.fontWeight = '700';
+      scoreSpan.style.color = r.color;
+      scoreSpan.textContent = `${r.score} pts`;
+
+      right.appendChild(killsSpan);
+      right.appendChild(scoreSpan);
 
       row.appendChild(left);
       row.appendChild(right);
@@ -613,10 +713,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
   btnPlayAgain.addEventListener('click', () => {
     const duration = parseInt(matchDurationSelect.value, 10) || 60;
+    game.spawnInitialAsteroids(6);
+
     if (!isSoloMode && window.networkManager.isHost) {
       window.networkManager.broadcast({
-        type: 'GAME_START',
-        duration
+        type: 'MATCH_START',
+        duration,
+        asteroids: game.asteroids
       });
     }
     startMatchSequence(duration);
@@ -634,7 +737,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   btnReturnLobby.addEventListener('click', handleUserLeaveMatch);
   btnExit.addEventListener('click', () => {
-    if (confirm('Leave current match and return to lobby?')) {
+    if (confirm('Leave current battle and return to lobby?')) {
       handleUserLeaveMatch();
     }
   });
@@ -642,7 +745,6 @@ document.addEventListener('DOMContentLoaded', () => {
   function handleUserLeaveMatch() {
     if (!isSoloMode && window.networkManager && window.networkManager.isConnected) {
       if (window.networkManager.isHost) {
-        // Host broadcasts to all clients that room is closing
         window.networkManager.broadcast({
           type: 'HOST_CLOSED_ROOM',
           message: 'The host has ended the match.'
@@ -672,10 +774,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function returnToLobby() {
     if (matchInterval) clearInterval(matchInterval);
+    if (syncInterval) clearInterval(syncInterval);
     game.state = 'LOBBY';
     game.reset();
-    window.soundManager.stopAllExpands();
-    window.isUserHolding = false;
+    if (window.soundManager) {
+      window.soundManager.stopThrustSound();
+    }
 
     gameOverScreen.classList.add('hidden');
     gameHud.classList.add('hidden');
@@ -684,7 +788,7 @@ document.addEventListener('DOMContentLoaded', () => {
     btnJoinRoom.disabled = false;
     joinStatus.textContent = '';
     btnCreateRoom.disabled = false;
-    btnCreateRoom.textContent = '⚡ Create Room';
+    btnCreateRoom.textContent = '⚡ Launch Flight Room';
     hostSetupView.style.display = 'block';
     hostLobbyView.style.display = 'none';
 
@@ -705,33 +809,33 @@ document.addEventListener('DOMContentLoaded', () => {
       hudTimer.classList.remove('urgent');
     }
 
-    territoryBar.innerHTML = '';
-    territoryLabels.innerHTML = '';
+    scoreboardList.innerHTML = '';
+    const sortedPlayers = Array.from(game.players.values()).sort((a, b) => b.score - a.score);
 
-    for (const player of game.players.values()) {
-      const pct = parseFloat(game.coverageStats[player.id] || 0);
-
-      if (pct > 0) {
-        const seg = document.createElement('div');
-        seg.className = 'territory-segment';
-        seg.style.width = `${pct}%`;
-        seg.style.backgroundColor = player.color;
-        territoryBar.appendChild(seg);
-      }
-
-      const lbl = document.createElement('div');
-      lbl.className = 'territory-label-item';
+    for (const player of sortedPlayers) {
+      const pill = document.createElement('div');
+      pill.className = 'pilot-score-pill';
 
       const dot = document.createElement('div');
       dot.className = 'player-dot';
       dot.style.backgroundColor = player.color;
 
-      const txt = document.createElement('span');
-      txt.textContent = `${player.name}: ${pct}%`;
+      const name = document.createElement('span');
+      name.textContent = player.id === myPlayerId ? `${player.name} (You)` : player.name;
 
-      lbl.appendChild(dot);
-      lbl.appendChild(txt);
-      territoryLabels.appendChild(lbl);
+      const score = document.createElement('span');
+      score.className = 'score-num';
+      score.textContent = player.score;
+
+      const kills = document.createElement('span');
+      kills.className = 'kills-tag';
+      kills.textContent = `${player.kills}K`;
+
+      pill.appendChild(dot);
+      pill.appendChild(name);
+      pill.appendChild(score);
+      pill.appendChild(kills);
+      scoreboardList.appendChild(pill);
     }
   }
 
@@ -741,105 +845,90 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }, 250);
 
-  // --- 10. INPUT HANDLERS ---
+  // --- 10. INPUT HANDLERS (ASTEROIDS CONTROLS) ---
 
-  function handleStart(clientX, clientY) {
-    if (game.state !== 'PLAYING') return;
-    if (window.isUserHolding) return;
-
-    window.isUserHolding = true;
-    const pos = game.screenToVirtual(clientX, clientY);
-
-    // 1. Immediately expand locally for 0ms lag
-    game.startExpand(myPlayerId, pos.x, pos.y);
-
-    // 2. Broadcast or send to host
-    if (!isSoloMode && window.networkManager) {
-      if (window.networkManager.isHost) {
-        window.networkManager.broadcast({
-          type: 'EXPAND_START',
-          playerId: myPlayerId,
-          x: pos.x,
-          y: pos.y
-        });
-      } else {
-        window.networkManager.sendToHost({
-          type: 'EXPAND_START',
-          playerId: myPlayerId,
-          x: pos.x,
-          y: pos.y
-        });
-      }
-    }
-  }
-
-  function handleRelease() {
-    if (!window.isUserHolding) return;
-    window.isUserHolding = false;
-
-    if (game.state !== 'PLAYING') return;
-
-    if (isSoloMode) {
-      game.releaseExpand(myPlayerId);
-    } else if (window.networkManager.isHost) {
-      const territory = game.releaseExpand(myPlayerId);
-      window.networkManager.broadcast({
-        type: 'EXPAND_RELEASE',
-        playerId: myPlayerId,
-        territory
-      });
-    } else {
-      // Client immediately stops expanding locally
-      game.stopExpand(myPlayerId);
-
-      // Client requests authoritative host to release and claim
-      window.networkManager.sendToHost({
-        type: 'REQUEST_RELEASE',
-        playerId: myPlayerId
-      });
-    }
-  }
-
-  // Mouse Listeners
-  canvas.addEventListener('mousedown', (e) => {
-    if (e.button === 0) {
-      handleStart(e.clientX, e.clientY);
-    }
-  });
-
-  window.addEventListener('mouseup', () => {
-    handleRelease();
-  });
-
-  // Touch Listeners
-  canvas.addEventListener('touchstart', (e) => {
-    e.preventDefault();
-    if (e.touches.length > 0) {
-      const touch = e.touches[0];
-      handleStart(touch.clientX, touch.clientY);
-    }
-  }, { passive: false });
-
-  window.addEventListener('touchend', () => {
-    handleRelease();
-  });
-
-  window.addEventListener('touchcancel', () => {
-    handleRelease();
-  });
-
-  // Keyboard Spacebar Listeners
+  // Keyboard controls
   window.addEventListener('keydown', (e) => {
-    if (e.code === 'Space' && !e.repeat && document.activeElement.tagName !== 'INPUT') {
+    if (document.activeElement.tagName === 'INPUT') return;
+
+    if (e.code === 'ArrowLeft' || e.code === 'KeyA') {
+      game.localInput.rotLeft = true;
       e.preventDefault();
-      handleStart(window.innerWidth / 2, window.innerHeight / 2);
+    } else if (e.code === 'ArrowRight' || e.code === 'KeyD') {
+      game.localInput.rotRight = true;
+      e.preventDefault();
+    } else if (e.code === 'ArrowUp' || e.code === 'KeyW') {
+      game.localInput.thrust = true;
+      e.preventDefault();
+    } else if (e.code === 'Space') {
+      if (!e.repeat) {
+        game.localInput.shoot = true;
+      }
+      e.preventDefault();
     }
   });
 
   window.addEventListener('keyup', (e) => {
-    if (e.code === 'Space' && document.activeElement.tagName !== 'INPUT') {
+    if (document.activeElement.tagName === 'INPUT') return;
+
+    if (e.code === 'ArrowLeft' || e.code === 'KeyA') {
+      game.localInput.rotLeft = false;
       e.preventDefault();
-      handleRelease();
+    } else if (e.code === 'ArrowRight' || e.code === 'KeyD') {
+      game.localInput.rotRight = false;
+      e.preventDefault();
+    } else if (e.code === 'ArrowUp' || e.code === 'KeyW') {
+      game.localInput.thrust = false;
+      if (window.soundManager) window.soundManager.stopThrustSound();
+      e.preventDefault();
+    } else if (e.code === 'Space') {
+      game.localInput.shoot = false;
+      e.preventDefault();
     }
   });
+
+  // Mobile / Touch Button Listeners
+  function bindTouchButton(element, onPress, onRelease) {
+    if (!element) return;
+    element.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      onPress();
+    });
+    element.addEventListener('pointerup', (e) => {
+      e.preventDefault();
+      onRelease();
+    });
+    element.addEventListener('pointercancel', (e) => {
+      e.preventDefault();
+      onRelease();
+    });
+  }
+
+  bindTouchButton(btnTouchLeft,
+    () => { game.localInput.rotLeft = true; },
+    () => { game.localInput.rotLeft = false; }
+  );
+
+  bindTouchButton(btnTouchRight,
+    () => { game.localInput.rotRight = true; },
+    () => { game.localInput.rotRight = false; }
+  );
+
+  bindTouchButton(btnTouchThrust,
+    () => { game.localInput.thrust = true; },
+    () => {
+      game.localInput.thrust = false;
+      if (window.soundManager) window.soundManager.stopThrustSound();
+    }
+  );
+
+  bindTouchButton(btnTouchFire,
+    () => {
+      game.localInput.shoot = true;
+      if (game.state === 'PLAYING') {
+        game.fireLaser(myPlayerId);
+      }
+    },
+    () => { game.localInput.shoot = false; }
+  );
 });

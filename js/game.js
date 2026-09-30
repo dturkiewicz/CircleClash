@@ -1,57 +1,81 @@
 /**
- * Circle Clash - Territory Conquest Game Engine
- * 60 FPS HTML5 Canvas engine with authoritative collision detection and territory tracking.
+ * AstroClash - Asteroids 2D Multiplayer Game Engine
+ * 60 FPS Canvas engine featuring classic Asteroids inertial physics,
+ * screen-wrapping toroidal space, vector-style ships, craggy asteroids, and bot AI.
  */
 class GameEngine {
   constructor(canvas) {
     this.canvas = canvas;
     this.ctx = canvas.getContext('2d');
 
-    // Virtual Arena Resolution (16:9)
+    // Virtual Arena Resolution (16:9 widescreen)
     this.V_WIDTH = 1600;
     this.V_HEIGHT = 900;
     this.scale = 1;
     this.offsetX = 0;
     this.offsetY = 0;
 
-    // Game Tuning
-    this.GROWTH_RATE = 110; // pixels per second
-    this.MAX_RADIUS = 280;  // maximum circle radius
-    this.MIN_RADIUS = 20;   // minimum circle radius to claim territory
+    // Physics Tuning (True Asteroids Feel)
+    this.ROT_SPEED = 4.4;      // radians/sec (~250 deg/sec)
+    this.THRUST_ACCEL = 440;   // px/sec^2
+    this.DRAG = 0.992;         // slight space damping per frame
+    this.MAX_SPEED = 480;      // max velocity cap
+    this.BULLET_SPEED = 780;   // laser speed px/sec
+    this.BULLET_LIFE = 1.35;   // laser lifetime in seconds
+    this.FIRE_COOLDOWN = 0.18; // seconds between shots
+    this.SHIP_RADIUS = 20;     // collision radius
 
-    // State
-    this.state = 'LOBBY'; // LOBBY, COUNTDOWN, PLAYING, GAME_OVER
-    this.players = new Map(); // id -> Player
+    // Game State
+    this.state = 'LOBBY';      // LOBBY, COUNTDOWN, PLAYING, GAME_OVER
+    this.players = new Map();  // id -> Player
     this.localPlayerId = null;
-    this.territories = []; // array of { id, playerId, color, x, y, r, timestamp }
-    this.particles = [];
-    this.ripples = [];
-    this.floatingTexts = [];
+    this.asteroids = [];       // array of Asteroids
+    this.bullets = [];         // array of Bullets
+    this.particles = [];       // visual debris particles
+    this.floatingTexts = [];   // floating combat labels
     this.screenShake = 0;
 
-    // Coverage & Timers
-    this.coverageStats = {}; // playerId -> percentage string
+    // Background Starfield (Parallax twinkling stars)
+    this.stars = this.generateStarfield(120);
+
+    // Match Timers
     this.timeRemaining = 60;
     this.matchDuration = 60;
     this.countdown = 3;
 
-    // Off-screen canvas for real-time territory coverage calculation
-    this.coverageCanvas = document.createElement('canvas');
-    this.coverageCanvas.width = 160;
-    this.coverageCanvas.height = 90;
-    this.coverageCtx = this.coverageCanvas.getContext('2d', { willReadFrequently: true });
-    this.lastCoverageCheck = 0;
+    // Host Callbacks / Hooks
+    this.onFireLaser = null;
+    this.onEntityDestroyed = null;
+    this.onPlayerKilled = null;
 
-    // Event hooks for Host broadcasts
-    this.onBotExpandStart = null;
-    this.onBotExpandStop = null;
-    this.onPlayerPop = null;
+    // Input state for local player
+    this.localInput = {
+      rotLeft: false,
+      rotRight: false,
+      thrust: false,
+      shoot: false
+    };
 
     // Loop
     this.lastFrameTime = performance.now();
     this.rafId = null;
 
     this.setupResizeListener();
+  }
+
+  generateStarfield(count) {
+    const stars = [];
+    for (let i = 0; i < count; i++) {
+      stars.push({
+        x: Math.random() * this.V_WIDTH,
+        y: Math.random() * this.V_HEIGHT,
+        size: Math.random() * 1.8 + 0.6,
+        alpha: Math.random() * 0.7 + 0.3,
+        twinkleSpeed: Math.random() * 2 + 1,
+        seed: Math.random() * Math.PI * 2
+      });
+    }
+    return stars;
   }
 
   setupResizeListener() {
@@ -85,6 +109,7 @@ class GameEngine {
     };
   }
 
+  // --- PLAYER MANAGEMENT ---
   initLocalPlayer(info) {
     this.localPlayerId = info.id;
     this.addOrUpdatePlayer({
@@ -93,159 +118,212 @@ class GameEngine {
       name: info.name,
       color: info.color,
       isHost: info.isHost,
-      isLocal: true,
-      expanding: null
+      isLocal: true
     });
   }
 
   addOrUpdatePlayer(playerData) {
     const existing = this.players.get(playerData.id) || {};
-    this.players.set(playerData.id, {
-      ...existing,
-      ...playerData,
-      expanding: existing.expanding || null
-    });
+    const player = {
+      id: playerData.id,
+      name: playerData.name || existing.name || 'Pilot',
+      color: playerData.color || existing.color || '#00f0ff',
+      isHost: playerData.isHost ?? existing.isHost ?? false,
+      isLocal: playerData.isLocal ?? existing.isLocal ?? false,
+      isBot: playerData.isBot ?? existing.isBot ?? false,
+      // Spatial & Flight Physics
+      x: playerData.x ?? existing.x ?? (this.V_WIDTH * (0.25 + Math.random() * 0.5)),
+      y: playerData.y ?? existing.y ?? (this.V_HEIGHT * (0.25 + Math.random() * 0.5)),
+      vx: playerData.vx ?? existing.vx ?? 0,
+      vy: playerData.vy ?? existing.vy ?? 0,
+      angle: playerData.angle ?? existing.angle ?? (-Math.PI / 2), // Default point up
+      thrusting: playerData.thrusting ?? existing.thrusting ?? false,
+      // Combat & Status
+      score: playerData.score ?? existing.score ?? 0,
+      kills: playerData.kills ?? existing.kills ?? 0,
+      deaths: playerData.deaths ?? existing.deaths ?? 0,
+      isAlive: playerData.isAlive ?? existing.isAlive ?? true,
+      respawnTimer: playerData.respawnTimer ?? existing.respawnTimer ?? 0,
+      shieldTimer: playerData.shieldTimer ?? existing.shieldTimer ?? 3.0, // 3s spawn shield
+      lastFireTime: existing.lastFireTime ?? 0,
+      // Bot specific state
+      botTargetId: existing.botTargetId ?? null,
+      botNextDecision: existing.botNextDecision ?? 0
+    };
+    this.players.set(playerData.id, player);
+    return player;
   }
 
   removePlayer(playerId) {
-    this.stopExpand(playerId);
     this.players.delete(playerId);
   }
 
-  // --- EXPANSION & TERRITORY LIFECYCLE ---
+  // --- ASTEROIDS CREATION & LIFECYCLE ---
+  createAsteroid(x, y, size = 3, vx = null, vy = null) {
+    // size 3: Large (r ~ 55), size 2: Med (r ~ 32), size 1: Small (r ~ 18)
+    const baseRadius = size === 3 ? 55 : size === 2 ? 32 : 18;
+    const speed = size === 3 ? (35 + Math.random() * 40) : size === 2 ? (60 + Math.random() * 60) : (90 + Math.random() * 90);
+    const moveAngle = Math.random() * Math.PI * 2;
 
-  startExpand(playerId, x, y) {
-    if (this.state !== 'PLAYING') return;
+    const asteroidVx = vx !== null ? vx : Math.cos(moveAngle) * speed;
+    const asteroidVy = vy !== null ? vy : Math.sin(moveAngle) * speed;
+
+    // Generate polygonal craggy vertices
+    const vertexCount = 10 + Math.floor(Math.random() * 5);
+    const shapeOffsets = [];
+    for (let i = 0; i < vertexCount; i++) {
+      shapeOffsets.push(0.8 + Math.random() * 0.4); // 80% to 120% radius jitter
+    }
+
+    return {
+      id: 'ast_' + Math.random().toString(36).substring(2, 9),
+      x: x !== null ? x : Math.random() * this.V_WIDTH,
+      y: y !== null ? y : Math.random() * this.V_HEIGHT,
+      vx: asteroidVx,
+      vy: asteroidVy,
+      radius: baseRadius,
+      size: size,
+      rot: Math.random() * Math.PI * 2,
+      rotSpeed: (Math.random() - 0.5) * 1.5,
+      points: size === 3 ? 20 : size === 2 ? 50 : 100,
+      shapeOffsets: shapeOffsets
+    };
+  }
+
+  spawnInitialAsteroids(count = 6) {
+    this.asteroids = [];
+    for (let i = 0; i < count; i++) {
+      // Spawn near edges to leave center safe for initial player spawn
+      const edge = Math.floor(Math.random() * 4);
+      let x, y;
+      if (edge === 0) { x = Math.random() * this.V_WIDTH; y = 30; }
+      else if (edge === 1) { x = this.V_WIDTH - 30; y = Math.random() * this.V_HEIGHT; }
+      else if (edge === 2) { x = Math.random() * this.V_WIDTH; y = this.V_HEIGHT - 30; }
+      else { x = 30; y = Math.random() * this.V_HEIGHT; }
+
+      this.asteroids.push(this.createAsteroid(x, y, 3));
+    }
+  }
+
+  maintainAsteroidPopulation(targetLargeCount = 5) {
+    const largeCount = this.asteroids.filter(a => a.size === 3).length;
+    if (largeCount < targetLargeCount && Math.random() < 0.03) {
+      // Spawn an asteroid at random border
+      const edge = Math.floor(Math.random() * 4);
+      let x = edge % 2 === 0 ? Math.random() * this.V_WIDTH : (edge === 1 ? this.V_WIDTH - 20 : 20);
+      let y = edge % 2 === 1 ? Math.random() * this.V_HEIGHT : (edge === 0 ? 20 : this.V_HEIGHT - 20);
+      this.asteroids.push(this.createAsteroid(x, y, 3));
+    }
+  }
+
+  // --- BULLETS & SHOOTING ---
+  fireLaser(playerId) {
     const player = this.players.get(playerId);
-    if (!player) return;
+    if (!player || !player.isAlive || this.state !== 'PLAYING') return null;
 
-    player.expanding = {
-      x: Math.round(x),
-      y: Math.round(y),
-      r: 10,
-      maxR: this.MAX_RADIUS
+    const now = performance.now() / 1000;
+    if (now - player.lastFireTime < this.FIRE_COOLDOWN) return null;
+    player.lastFireTime = now;
+
+    // Bullet origin at ship nose
+    const noseDist = 24;
+    const bx = player.x + Math.cos(player.angle) * noseDist;
+    const by = player.y + Math.sin(player.angle) * noseDist;
+
+    // Bullet velocity is ship velocity + projectile forward velocity
+    const bvx = Math.cos(player.angle) * this.BULLET_SPEED + player.vx * 0.25;
+    const bvy = Math.sin(player.angle) * this.BULLET_SPEED + player.vy * 0.25;
+
+    const bullet = {
+      id: 'b_' + Math.random().toString(36).substring(2, 8),
+      playerId: player.id,
+      color: player.color,
+      x: bx,
+      y: by,
+      vx: bvx,
+      vy: bvy,
+      angle: player.angle,
+      life: this.BULLET_LIFE,
+      spawnTime: now
     };
 
-    if (window.soundManager) {
-      window.soundManager.startExpandSound(playerId);
+    this.bullets.push(bullet);
+
+    // Audio chirp for local player
+    if (player.id === this.localPlayerId && window.soundManager) {
+      window.soundManager.playLaser();
     }
+
+    if (this.onFireLaser) {
+      this.onFireLaser(bullet);
+    }
+
+    return bullet;
   }
 
-  stopExpand(playerId) {
-    const player = this.players.get(playerId);
-    if (player) {
-      player.expanding = null;
-    }
-    if (window.soundManager) {
-      window.soundManager.stopExpandSound(playerId);
-    }
-  }
-
-  claimTerritory(territory) {
-    if (!territory) return;
-    // Deduplicate
-    if (this.territories.some(t => t.id === territory.id)) return;
-
-    this.territories.push(territory);
-
-    // Guaranteed cleanup for that player's expanding state
-    this.stopExpand(territory.playerId);
-
-    // Shockwave ripple
-    this.ripples.push({
-      x: territory.x,
-      y: territory.y,
-      r: territory.r,
-      maxR: territory.r + 35,
-      color: territory.color,
-      alpha: 0.8
+  spawnLaserFromRemote(bulletData) {
+    this.bullets.push({
+      ...bulletData,
+      life: bulletData.life || this.BULLET_LIFE,
+      spawnTime: performance.now() / 1000
     });
-
     if (window.soundManager) {
-      window.soundManager.playClaim(territory.r);
+      window.soundManager.playLaser();
     }
   }
 
-  releaseExpand(playerId) {
-    if (this.state !== 'PLAYING') return null;
-    const player = this.players.get(playerId);
-    if (!player || !player.expanding) return null;
-
-    const { x, y, r } = player.expanding;
-    this.stopExpand(playerId);
-
-    if (r >= this.MIN_RADIUS) {
-      const territory = {
-        id: 't_' + Math.random().toString(36).substring(2, 9),
-        playerId: player.id,
-        color: player.color,
-        x,
-        y,
-        r: Math.round(r),
-        timestamp: Date.now()
-      };
-
-      this.claimTerritory(territory);
-      return territory;
-    }
-    return null;
-  }
-
-  popPlayer(playerId, x, y, radius) {
-    const player = this.players.get(playerId);
-    if (!player) return;
-
-    this.stopExpand(playerId);
-
-    if (window.soundManager) {
-      window.soundManager.playPop();
-    }
-
-    // Explosion sparks
-    this.createExplosion(x, y, player.color, Math.min(45, Math.max(16, radius / 3)));
-    this.screenShake = Math.min(18, 6 + radius * 0.06);
-
-    this.floatingTexts.push({
-      x,
-      y: y - 20,
-      text: 'POPPED!',
-      color: '#ff3366',
-      alpha: 1,
-      vy: -1.5,
-      life: 50
-    });
-  }
-
-  createExplosion(x, y, color, count = 24) {
+  // --- EXPLOSIONS & DEBRIS PARTICLES ---
+  createVectorExplosion(x, y, color, count = 20, isShip = false) {
+    // 1. Shards / Vector lines
     for (let i = 0; i < count; i++) {
-      const angle = (Math.PI * 2 * i) / count + (Math.random() - 0.5) * 0.5;
-      const speed = 2 + Math.random() * 8;
+      const angle = Math.random() * Math.PI * 2;
+      const speed = 40 + Math.random() * (isShip ? 280 : 180);
       this.particles.push({
+        type: 'line',
         x,
         y,
         vx: Math.cos(angle) * speed,
         vy: Math.sin(angle) * speed,
-        radius: 3 + Math.random() * 4,
-        color,
+        length: 4 + Math.random() * (isShip ? 12 : 8),
+        angle: angle,
+        rotSpeed: (Math.random() - 0.5) * 12,
+        color: color,
         alpha: 1,
-        friction: 0.94,
-        gravity: 0.08,
-        decay: 0.02 + Math.random() * 0.02
+        decay: 0.8 + Math.random() * 0.8 // lifetime seconds
       });
     }
+
+    // 2. High-speed spark dots
+    for (let i = 0; i < Math.floor(count * 0.7); i++) {
+      const angle = Math.random() * Math.PI * 2;
+      const speed = 80 + Math.random() * (isShip ? 340 : 200);
+      this.particles.push({
+        type: 'dot',
+        x,
+        y,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed,
+        radius: 1.5 + Math.random() * 2,
+        color: '#ffffff',
+        alpha: 1,
+        decay: 0.4 + Math.random() * 0.5
+      });
+    }
+
+    this.screenShake = Math.min(22, this.screenShake + (isShip ? 14 : 7));
   }
 
   // --- BOT MANAGEMENT ---
   addBot() {
     const botColors = ['#00f0ff', '#ff0077', '#39ff14', '#ffe600', '#bf00ff', '#ff5722'];
-    const botNames = ['PixelBot', 'NexusAI', 'Vortex', 'Echo', 'NeonDrift', 'Blitz'];
+    const botNames = ['StarDrifter', 'NovaBlade', 'VoidAce', 'Pulsar', 'QuantumWing', 'Vortex9'];
 
     const usedColors = new Set([...this.players.values()].map(p => p.color));
     const availableColors = botColors.filter(c => !usedColors.has(c));
     const botColor = availableColors[0] || botColors[Math.floor(Math.random() * botColors.length)];
 
     const botId = 'bot_' + Math.random().toString(36).substring(2, 7);
-    const botName = botNames[this.players.size % botNames.length] + ' [BOT]';
+    const botName = botNames[this.players.size % botNames.length] + ' [AI]';
 
     const bot = {
       id: botId,
@@ -254,147 +332,295 @@ class GameEngine {
       isHost: false,
       isBot: true,
       isLocal: false,
-      expanding: null,
-      botState: 'IDLE',
-      botTimer: performance.now() + 1000 + Math.random() * 2000
+      x: this.V_WIDTH * (0.2 + Math.random() * 0.6),
+      y: this.V_HEIGHT * (0.2 + Math.random() * 0.6),
+      vx: 0,
+      vy: 0,
+      angle: Math.random() * Math.PI * 2,
+      thrusting: false,
+      score: 0,
+      kills: 0,
+      deaths: 0,
+      isAlive: true,
+      respawnTimer: 0,
+      shieldTimer: 3.0,
+      lastFireTime: 0,
+      botNextDecision: 0
     };
 
     this.players.set(botId, bot);
     return bot;
   }
 
-  updateBots(now) {
+  updateBots(now, dt) {
     if (this.state !== 'PLAYING') return;
 
-    for (const player of this.players.values()) {
-      if (!player.isBot) continue;
+    for (const bot of this.players.values()) {
+      if (!bot.isBot || !bot.isAlive) continue;
 
-      if (player.botState === 'IDLE' && now >= player.botTimer) {
-        const padding = 120;
-        const x = padding + Math.random() * (this.V_WIDTH - padding * 2);
-        const y = padding + Math.random() * (this.V_HEIGHT - padding * 2);
+      // 1. Find nearest target (nearest asteroid or enemy ship)
+      let bestTarget = null;
+      let bestDist = Infinity;
 
-        this.startExpand(player.id, x, y);
-        player.botState = 'GROWING';
-        player.botHoldDuration = 800 + Math.random() * 1400;
-        player.botExpandStartTime = now;
-
-        if (this.onBotExpandStart) {
-          this.onBotExpandStart(player.id, x, y);
+      // Look at asteroids first
+      for (const ast of this.asteroids) {
+        const dx = ast.x - bot.x;
+        const dy = ast.y - bot.y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist < bestDist) {
+          bestDist = dist;
+          bestTarget = ast;
         }
-      } else if (player.botState === 'GROWING' && player.expanding) {
-        const elapsed = now - player.botExpandStartTime;
+      }
 
-        // Emergency release if an opponent gets close
-        let emergencyRelease = false;
-        for (const other of this.players.values()) {
-          if (other.id !== player.id && other.expanding) {
-            const dx = player.expanding.x - other.expanding.x;
-            const dy = player.expanding.y - other.expanding.y;
-            const dist = Math.sqrt(dx * dx + dy * dy);
-            if (dist < (player.expanding.r + other.expanding.r + 30)) {
-              emergencyRelease = true;
-              break;
+      // Also consider enemy players
+      for (const other of this.players.values()) {
+        if (other.id !== bot.id && other.isAlive) {
+          const dx = other.x - bot.x;
+          const dy = other.y - bot.y;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+          if (dist < bestDist * 0.8) { // slightly prioritize enemy ships
+            bestDist = dist;
+            bestTarget = other;
+          }
+        }
+      }
+
+      if (!bestTarget) continue;
+
+      // 2. Compute angle to target
+      const targetAngle = Math.atan2(bestTarget.y - bot.y, bestTarget.x - bot.x);
+      let angleDiff = targetAngle - bot.angle;
+      while (angleDiff > Math.PI) angleDiff -= Math.PI * 2;
+      while (angleDiff < -Math.PI) angleDiff += Math.PI * 2;
+
+      // Rotate towards target
+      if (Math.abs(angleDiff) > 0.08) {
+        bot.angle += Math.sign(angleDiff) * this.ROT_SPEED * dt;
+      }
+
+      // Check for incoming collision hazard (emergency evasion)
+      let emergencyEvade = false;
+      if (bestDist < 90) {
+        emergencyEvade = true;
+      }
+
+      // 3. Thrust in bursts when facing target or evading
+      if (emergencyEvade) {
+        // Thrust sideways/away
+        bot.thrusting = true;
+        bot.vx += Math.cos(bot.angle + Math.PI / 2) * this.THRUST_ACCEL * dt;
+        bot.vy += Math.sin(bot.angle + Math.PI / 2) * this.THRUST_ACCEL * dt;
+      } else if (Math.abs(angleDiff) < 0.45 && bestDist > 160) {
+        const currentSpeed = Math.sqrt(bot.vx * bot.vx + bot.vy * bot.vy);
+        if (currentSpeed < 260) {
+          bot.thrusting = true;
+          bot.vx += Math.cos(bot.angle) * this.THRUST_ACCEL * dt;
+          bot.vy += Math.sin(bot.angle) * this.THRUST_ACCEL * dt;
+        } else {
+          bot.thrusting = false;
+        }
+      } else {
+        bot.thrusting = false;
+      }
+
+      // 4. Shoot when aligned
+      if (Math.abs(angleDiff) < 0.22 && bestDist < 650) {
+        this.fireLaser(bot.id);
+      }
+    }
+  }
+
+  // --- COLLISION DETECTION (AUTHORITATIVE) ---
+  checkCollisions() {
+    if (this.state !== 'PLAYING') return;
+
+    // 1. Bullets vs Asteroids
+    for (let bi = this.bullets.length - 1; bi >= 0; bi--) {
+      const b = this.bullets[bi];
+      let bulletHit = false;
+
+      for (let ai = this.asteroids.length - 1; ai >= 0; ai--) {
+        const ast = this.asteroids[ai];
+        const dx = b.x - ast.x;
+        const dy = b.y - ast.y;
+        const distSq = dx * dx + dy * dy;
+
+        if (distSq <= ast.radius * ast.radius) {
+          // HIT!
+          bulletHit = true;
+          const shooter = this.players.get(b.playerId);
+          if (shooter) {
+            shooter.score += ast.points;
+            if (shooter.id === this.localPlayerId && window.soundManager) {
+              window.soundManager.playScorePing();
             }
           }
-        }
 
-        if (elapsed >= player.botHoldDuration || emergencyRelease || player.expanding.r >= this.MAX_RADIUS * 0.9) {
-          const territory = this.releaseExpand(player.id);
-          player.botState = 'IDLE';
-          player.botTimer = now + 400 + Math.random() * 1200;
+          // Spawn floating score
+          this.floatingTexts.push({
+            x: ast.x,
+            y: ast.y - 15,
+            text: `+${ast.points}`,
+            color: '#ffe600',
+            alpha: 1,
+            vy: -40,
+            life: 0.9
+          });
 
-          if (this.onBotExpandStop) {
-            this.onBotExpandStop(player.id, territory);
+          // Explosion sound & particles
+          if (window.soundManager) {
+            window.soundManager.playExplosion('asteroid');
           }
+          this.createVectorExplosion(ast.x, ast.y, '#9bb2d4', ast.size * 10);
+
+          // Split asteroid if size > 1
+          if (ast.size > 1) {
+            const nextSize = ast.size - 1;
+            const splitAngle1 = Math.random() * Math.PI * 2;
+            const splitAngle2 = splitAngle1 + Math.PI * 0.75 + Math.random() * 0.5;
+            const splitSpeed = 80 + Math.random() * 60;
+
+            const a1 = this.createAsteroid(
+              ast.x + Math.cos(splitAngle1) * 15,
+              ast.y + Math.sin(splitAngle1) * 15,
+              nextSize,
+              Math.cos(splitAngle1) * splitSpeed,
+              Math.sin(splitAngle1) * splitSpeed
+            );
+            const a2 = this.createAsteroid(
+              ast.x + Math.cos(splitAngle2) * 15,
+              ast.y + Math.sin(splitAngle2) * 15,
+              nextSize,
+              Math.cos(splitAngle2) * splitSpeed,
+              Math.sin(splitAngle2) * splitSpeed
+            );
+
+            this.asteroids.splice(ai, 1, a1, a2);
+          } else {
+            this.asteroids.splice(ai, 1);
+          }
+
+          if (this.onEntityDestroyed) {
+            this.onEntityDestroyed({
+              type: 'asteroid',
+              id: ast.id,
+              x: ast.x,
+              y: ast.y,
+              killerId: b.playerId,
+              points: ast.points
+            });
+          }
+
+          break; // bullet can only hit one asteroid
+        }
+      }
+
+      if (bulletHit) {
+        this.bullets.splice(bi, 1);
+        continue;
+      }
+
+      // 2. Bullets vs Ships (PvP Combat)
+      for (const targetPlayer of this.players.values()) {
+        if (!targetPlayer.isAlive || targetPlayer.shieldTimer > 0) continue;
+        if (targetPlayer.id === b.playerId) continue; // don't shoot yourself
+
+        const dx = b.x - targetPlayer.x;
+        const dy = b.y - targetPlayer.y;
+        const distSq = dx * dx + dy * dy;
+
+        if (distSq <= this.SHIP_RADIUS * this.SHIP_RADIUS) {
+          // SHIP DESTROYED BY LASER!
+          this.bullets.splice(bi, 1);
+          this.killShip(targetPlayer, b.playerId, 'laser');
+          break;
         }
       }
     }
-  }
 
-  // --- COLLISION DETECTION (Expanding vs Expanding) ---
-  checkExpandingCollisions() {
-    const expandingPlayers = [...this.players.values()].filter(p => p.expanding);
-    const poppedIds = new Set();
-
-    for (let i = 0; i < expandingPlayers.length; i++) {
-      for (let j = i + 1; j < expandingPlayers.length; j++) {
-        const p1 = expandingPlayers[i];
-        const p2 = expandingPlayers[j];
-
-        const dx = p1.expanding.x - p2.expanding.x;
-        const dy = p1.expanding.y - p2.expanding.y;
-        const dist = Math.sqrt(dx * dx + dy * dy);
-
-        if (dist < (p1.expanding.r + p2.expanding.r)) {
-          poppedIds.add(p1.id);
-          poppedIds.add(p2.id);
-        }
-      }
-    }
-
-    for (const id of poppedIds) {
-      const p = this.players.get(id);
-      if (p && p.expanding) {
-        const { x, y, r } = p.expanding;
-        this.popPlayer(id, x, y, r);
-
-        if (this.onPlayerPop) {
-          this.onPlayerPop(id, x, y, r);
-        }
-      }
-    }
-  }
-
-  // --- COVERAGE CALCULATION ---
-  updateCoverage() {
-    const w = this.coverageCanvas.width;
-    const h = this.coverageCanvas.height;
-    const scaleX = w / this.V_WIDTH;
-    const scaleY = h / this.V_HEIGHT;
-
-    this.coverageCtx.fillStyle = '#000000';
-    this.coverageCtx.fillRect(0, 0, w, h);
-
-    const colorMap = new Map();
-    let idx = 1;
+    // 3. Ships vs Asteroids (Collision)
     for (const player of this.players.values()) {
-      colorMap.set(player.id, idx++);
+      if (!player.isAlive || player.shieldTimer > 0) continue;
+
+      for (const ast of this.asteroids) {
+        const dx = player.x - ast.x;
+        const dy = player.y - ast.y;
+        const distSq = dx * dx + dy * dy;
+        const hitRadius = this.SHIP_RADIUS + ast.radius * 0.85;
+
+        if (distSq <= hitRadius * hitRadius) {
+          // SHIP DESTROYED BY ASTEROID CRASH!
+          this.killShip(player, null, 'asteroid');
+          break;
+        }
+      }
     }
+  }
 
-    for (const t of this.territories) {
-      const mappedId = colorMap.get(t.playerId);
-      if (!mappedId) continue;
-      this.coverageCtx.fillStyle = `rgb(${mappedId}, 0, 0)`;
-      this.coverageCtx.beginPath();
-      this.coverageCtx.arc(t.x * scaleX, t.y * scaleY, t.r * scaleX, 0, Math.PI * 2);
-      this.coverageCtx.fill();
-    }
+  killShip(victim, killerId = null, reason = 'laser') {
+    victim.isAlive = false;
+    victim.deaths += 1;
+    victim.respawnTimer = 2.0; // 2 second respawn delay
+    victim.vx = 0;
+    victim.vy = 0;
 
-    const imgData = this.coverageCtx.getImageData(0, 0, w, h).data;
-    const totalPixels = w * h;
-    const pixelCounts = {};
-
-    for (let i = 0; i < imgData.length; i += 4) {
-      const val = imgData[i];
-      if (val > 0) {
-        pixelCounts[val] = (pixelCounts[val] || 0) + 1;
+    // Credit killer
+    let killerName = 'Space Hazard';
+    if (killerId) {
+      const killer = this.players.get(killerId);
+      if (killer) {
+        killer.score += 250;
+        killer.kills += 1;
+        killerName = killer.name;
+        if (killer.id === this.localPlayerId && window.soundManager) {
+          window.soundManager.playScorePing();
+        }
       }
     }
 
-    const stats = {};
-    for (const [playerId, mappedId] of colorMap.entries()) {
-      const count = pixelCounts[mappedId] || 0;
-      stats[playerId] = ((count / totalPixels) * 100).toFixed(1);
+    // Audio & Visual explosion
+    if (window.soundManager) {
+      window.soundManager.playExplosion('ship');
     }
-    this.coverageStats = stats;
+    this.createVectorExplosion(victim.x, victim.y, victim.color, 35, true);
+
+    // Floating text
+    this.floatingTexts.push({
+      x: victim.x,
+      y: victim.y - 25,
+      text: killerId ? `💥 BLASTED BY ${killerName.toUpperCase()}!` : '💥 CRUSHED BY ASTEROID!',
+      color: '#ff3366',
+      alpha: 1,
+      vy: -35,
+      life: 1.5
+    });
+
+    if (this.onPlayerKilled) {
+      this.onPlayerKilled(victim.id, killerId, reason);
+    }
+  }
+
+  respawnShip(player) {
+    player.isAlive = true;
+    player.respawnTimer = 0;
+    player.shieldTimer = 3.0; // 3 seconds invulnerability
+    player.x = this.V_WIDTH / 2 + (Math.random() - 0.5) * 400;
+    player.y = this.V_HEIGHT / 2 + (Math.random() - 0.5) * 300;
+    player.vx = 0;
+    player.vy = 0;
+    player.angle = -Math.PI / 2;
+
+    if (player.id === this.localPlayerId && window.soundManager) {
+      window.soundManager.playRespawn();
+    }
   }
 
   // --- GAME LOOP ---
   startLoop() {
     if (this.rafId) cancelAnimationFrame(this.rafId);
     const loop = (now) => {
-      const dt = Math.min(0.1, (now - this.lastFrameTime) / 1000);
+      const dt = Math.min(0.08, (now - this.lastFrameTime) / 1000);
       this.lastFrameTime = now;
 
       this.update(now, dt);
@@ -411,76 +637,148 @@ class GameEngine {
   }
 
   update(now, dt) {
-    if (this.state === 'PLAYING') {
-      // 1. Expand active circles
-      for (const player of this.players.values()) {
-        // Invariant: Local player can NEVER expand if user is not currently holding input!
-        if (player.id === this.localPlayerId && !window.isUserHolding) {
-          if (player.expanding) {
-            this.stopExpand(player.id);
-          }
-          continue;
-        }
+    // 1. Process Local Player Controls
+    const local = this.players.get(this.localPlayerId);
+    if (local && local.isAlive && this.state === 'PLAYING') {
+      // Rotation
+      if (this.localInput.rotLeft) {
+        local.angle -= this.ROT_SPEED * dt;
+      }
+      if (this.localInput.rotRight) {
+        local.angle += this.ROT_SPEED * dt;
+      }
 
-        if (player.expanding) {
-          player.expanding.r = Math.min(
-            player.expanding.maxR,
-            player.expanding.r + this.GROWTH_RATE * dt
-          );
+      // Thrust
+      local.thrusting = this.localInput.thrust;
+      if (local.thrusting) {
+        local.vx += Math.cos(local.angle) * this.THRUST_ACCEL * dt;
+        local.vy += Math.sin(local.angle) * this.THRUST_ACCEL * dt;
+
+        // Thrust audio
+        if (window.soundManager) {
+          window.soundManager.startThrustSound();
+        }
+      } else {
+        if (window.soundManager) {
+          window.soundManager.stopThrustSound();
         }
       }
 
-      // 2. Host-authoritative collisions and bot AI
-      if (!window.networkManager || window.networkManager.isHost) {
-        this.checkExpandingCollisions();
-        this.updateBots(now);
-      }
-
-      // 3. Periodic Coverage Check
-      if (now - this.lastCoverageCheck > 300) {
-        this.updateCoverage();
-        this.lastCoverageCheck = now;
+      // Shoot
+      if (this.localInput.shoot) {
+        this.fireLaser(local.id);
       }
     }
 
-    // Update particles
+    // 2. Update All Ships Physics & Status
+    for (const player of this.players.values()) {
+      if (!player.isAlive) {
+        // Respawn countdown
+        if (player.respawnTimer > 0) {
+          player.respawnTimer -= dt;
+          if (player.respawnTimer <= 0) {
+            this.respawnShip(player);
+          }
+        }
+        continue;
+      }
+
+      // Decay shield
+      if (player.shieldTimer > 0) {
+        player.shieldTimer = Math.max(0, player.shieldTimer - dt);
+      }
+
+      // Inertial damping (slight space drag)
+      player.vx *= Math.pow(this.DRAG, dt * 60);
+      player.vy *= Math.pow(this.DRAG, dt * 60);
+
+      // Speed cap
+      const speed = Math.sqrt(player.vx * player.vx + player.vy * player.vy);
+      if (speed > this.MAX_SPEED) {
+        player.vx = (player.vx / speed) * this.MAX_SPEED;
+        player.vy = (player.vy / speed) * this.MAX_SPEED;
+      }
+
+      // Apply velocity
+      player.x += player.vx * dt;
+      player.y += player.vy * dt;
+
+      // Toroidal Screen Wrapping
+      if (player.x < 0) player.x += this.V_WIDTH;
+      else if (player.x > this.V_WIDTH) player.x -= this.V_WIDTH;
+      if (player.y < 0) player.y += this.V_HEIGHT;
+      else if (player.y > this.V_HEIGHT) player.y -= this.V_HEIGHT;
+    }
+
+    // 3. Update Asteroids
+    for (const ast of this.asteroids) {
+      ast.x += ast.vx * dt;
+      ast.y += ast.vy * dt;
+      ast.rot += ast.rotSpeed * dt;
+
+      // Wrap asteroids around edges
+      if (ast.x < -ast.radius) ast.x += this.V_WIDTH + ast.radius * 2;
+      else if (ast.x > this.V_WIDTH + ast.radius) ast.x -= this.V_WIDTH + ast.radius * 2;
+      if (ast.y < -ast.radius) ast.y += this.V_HEIGHT + ast.radius * 2;
+      else if (ast.y > this.V_HEIGHT + ast.radius) ast.y -= this.V_HEIGHT + ast.radius * 2;
+    }
+
+    // 4. Update Bullets
+    for (let i = this.bullets.length - 1; i >= 0; i--) {
+      const b = this.bullets[i];
+      b.x += b.vx * dt;
+      b.y += b.vy * dt;
+      b.life -= dt;
+
+      // Wrap bullets
+      if (b.x < 0) b.x += this.V_WIDTH;
+      else if (b.x > this.V_WIDTH) b.x -= this.V_WIDTH;
+      if (b.y < 0) b.y += this.V_HEIGHT;
+      else if (b.y > this.V_HEIGHT) b.y -= this.V_HEIGHT;
+
+      if (b.life <= 0) {
+        this.bullets.splice(i, 1);
+      }
+    }
+
+    // 5. Host-Authoritative Collisions & Bots
+    if (!window.networkManager || window.networkManager.isHost) {
+      this.checkCollisions();
+      this.updateBots(now, dt);
+      if (this.state === 'PLAYING') {
+        this.maintainAsteroidPopulation();
+      }
+    }
+
+    // 6. Update Debris Particles
     for (let i = this.particles.length - 1; i >= 0; i--) {
       const p = this.particles[i];
-      p.x += p.vx;
-      p.y += p.vy;
-      p.vx *= p.friction;
-      p.vy *= p.friction;
-      p.vy += p.gravity;
-      p.alpha -= p.decay;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.vx *= Math.pow(0.96, dt * 60);
+      p.vy *= Math.pow(0.96, dt * 60);
+      if (p.rotSpeed) p.angle += p.rotSpeed * dt;
+      p.alpha -= dt / p.decay;
+
       if (p.alpha <= 0) {
         this.particles.splice(i, 1);
       }
     }
 
-    // Update ripples
-    for (let i = this.ripples.length - 1; i >= 0; i--) {
-      const r = this.ripples[i];
-      r.r += 2.5;
-      r.alpha -= 0.025;
-      if (r.alpha <= 0 || r.r >= r.maxR) {
-        this.ripples.splice(i, 1);
-      }
-    }
-
-    // Update floating texts
+    // 7. Update Floating Combat Texts
     for (let i = this.floatingTexts.length - 1; i >= 0; i--) {
       const ft = this.floatingTexts[i];
-      ft.y += ft.vy;
-      ft.life -= 1;
-      ft.alpha = ft.life / 50;
+      ft.y += ft.vy * dt;
+      ft.life -= dt;
+      ft.alpha = Math.max(0, ft.life / 0.9);
       if (ft.life <= 0) {
         this.floatingTexts.splice(i, 1);
       }
     }
 
-    // Screen shake
+    // 8. Screen Shake
     if (this.screenShake > 0) {
-      this.screenShake = Math.max(0, this.screenShake - dt * 25);
+      this.screenShake = Math.max(0, this.screenShake - dt * 30);
     }
   }
 
@@ -489,8 +787,8 @@ class GameEngine {
     const ctx = this.ctx;
     ctx.save();
 
-    // Void background
-    ctx.fillStyle = '#080a10';
+    // Deep space black void
+    ctx.fillStyle = '#06080d';
     ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
 
     ctx.translate(this.offsetX, this.offsetY);
@@ -502,53 +800,28 @@ class GameEngine {
       ctx.translate(shakeX, shakeY);
     }
 
-    // 1. Grid & Borders
-    this.drawArenaGrid(ctx);
+    // 1. Starfield
+    this.drawStarfield(ctx);
 
-    // 2. Claimed Territories
-    this.drawTerritories(ctx);
+    // 2. Arena Boundary Glow
+    this.drawArenaBorder(ctx);
 
-    // 3. Shockwave Ripples
-    for (const rip of this.ripples) {
-      ctx.strokeStyle = rip.color;
-      ctx.globalAlpha = Math.max(0, rip.alpha);
-      ctx.lineWidth = 4;
-      ctx.beginPath();
-      ctx.arc(rip.x, rip.y, rip.r, 0, Math.PI * 2);
-      ctx.stroke();
-    }
-    ctx.globalAlpha = 1;
+    // 3. Asteroids
+    this.drawAsteroids(ctx);
 
-    // 4. Expanding Circles
-    this.drawExpandingCircles(ctx);
+    // 4. Lasers / Bullets
+    this.drawBullets(ctx);
 
-    // 5. Particles
-    for (const p of this.particles) {
-      ctx.fillStyle = p.color;
-      ctx.globalAlpha = Math.max(0, p.alpha);
-      ctx.shadowColor = p.color;
-      ctx.shadowBlur = 8;
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
-      ctx.fill();
-    }
-    ctx.shadowBlur = 0;
-    ctx.globalAlpha = 1;
+    // 5. Spaceships
+    this.drawShips(ctx);
 
-    // 6. Floating texts
-    for (const ft of this.floatingTexts) {
-      ctx.font = 'bold 22px "Segoe UI", Roboto, sans-serif';
-      ctx.fillStyle = ft.color;
-      ctx.globalAlpha = Math.max(0, ft.alpha);
-      ctx.textAlign = 'center';
-      ctx.shadowColor = '#000';
-      ctx.shadowBlur = 6;
-      ctx.fillText(ft.text, ft.x, ft.y);
-    }
-    ctx.shadowBlur = 0;
-    ctx.globalAlpha = 1;
+    // 6. Debris Particles
+    this.drawParticles(ctx);
 
-    // 7. Countdown
+    // 7. Floating Combat Labels
+    this.drawFloatingTexts(ctx);
+
+    // 8. Countdown Overlay
     if (this.state === 'COUNTDOWN') {
       this.drawCountdownOverlay(ctx);
     }
@@ -556,87 +829,205 @@ class GameEngine {
     ctx.restore();
   }
 
-  drawArenaGrid(ctx) {
-    ctx.fillStyle = '#0d111a';
-    ctx.fillRect(0, 0, this.V_WIDTH, this.V_HEIGHT);
-
-    ctx.strokeStyle = 'rgba(255, 255, 255, 0.04)';
-    ctx.lineWidth = 1;
-    const gridSize = 50;
-
-    ctx.beginPath();
-    for (let x = 0; x <= this.V_WIDTH; x += gridSize) {
-      ctx.moveTo(x, 0);
-      ctx.lineTo(x, this.V_HEIGHT);
+  drawStarfield(ctx) {
+    const now = performance.now() * 0.002;
+    for (const star of this.stars) {
+      const twinkle = Math.sin(now * star.twinkleSpeed + star.seed) * 0.3 + 0.7;
+      ctx.fillStyle = `rgba(255, 255, 255, ${Math.max(0.1, star.alpha * twinkle)})`;
+      ctx.beginPath();
+      ctx.arc(star.x, star.y, star.size, 0, Math.PI * 2);
+      ctx.fill();
     }
-    for (let y = 0; y <= this.V_HEIGHT; y += gridSize) {
-      ctx.moveTo(0, y);
-      ctx.lineTo(this.V_WIDTH, y);
-    }
-    ctx.stroke();
+  }
 
-    ctx.strokeStyle = 'rgba(0, 240, 255, 0.4)';
+  drawArenaBorder(ctx) {
+    ctx.strokeStyle = 'rgba(0, 240, 255, 0.25)';
     ctx.shadowColor = '#00f0ff';
-    ctx.shadowBlur = 12;
-    ctx.lineWidth = 3;
+    ctx.shadowBlur = 10;
+    ctx.lineWidth = 2;
     ctx.strokeRect(0, 0, this.V_WIDTH, this.V_HEIGHT);
     ctx.shadowBlur = 0;
   }
 
-  drawTerritories(ctx) {
-    for (const t of this.territories) {
+  drawAsteroids(ctx) {
+    for (const ast of this.asteroids) {
       ctx.save();
-      ctx.fillStyle = t.color;
-      ctx.globalAlpha = 0.85;
+      ctx.translate(ast.x, ast.y);
+      ctx.rotate(ast.rot);
 
+      const numPts = ast.shapeOffsets.length;
       ctx.beginPath();
-      ctx.arc(t.x, t.y, t.r, 0, Math.PI * 2);
+      for (let i = 0; i < numPts; i++) {
+        const a = (i / numPts) * Math.PI * 2;
+        const r = ast.radius * ast.shapeOffsets[i];
+        const px = Math.cos(a) * r;
+        const py = Math.sin(a) * r;
+        if (i === 0) ctx.moveTo(px, py);
+        else ctx.lineTo(px, py);
+      }
+      ctx.closePath();
+
+      // Asteroid fill (dark void rock)
+      ctx.fillStyle = '#0f1422';
       ctx.fill();
 
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.35)';
-      ctx.lineWidth = 2;
+      // Vector wireframe glow
+      ctx.strokeStyle = '#8fa4be';
+      ctx.lineWidth = 2.2;
+      ctx.shadowColor = '#4a6b8f';
+      ctx.shadowBlur = 6;
       ctx.stroke();
 
       ctx.restore();
     }
   }
 
-  drawExpandingCircles(ctx) {
-    const now = performance.now();
-
-    for (const player of this.players.values()) {
-      if (!player.expanding) continue;
-
-      const { x, y, r } = player.expanding;
-      const pulse = Math.sin(now * 0.015) * 3;
-
+  drawBullets(ctx) {
+    for (const b of this.bullets) {
       ctx.save();
-      ctx.shadowColor = player.color;
-      ctx.shadowBlur = 18;
+      ctx.translate(b.x, b.y);
+      ctx.rotate(b.angle);
 
-      ctx.fillStyle = player.color;
-      ctx.globalAlpha = 0.35;
+      ctx.shadowColor = b.color;
+      ctx.shadowBlur = 12;
+
+      // Glow beam
+      ctx.strokeStyle = b.color;
+      ctx.lineWidth = 4;
       ctx.beginPath();
-      ctx.arc(x, y, r, 0, Math.PI * 2);
-      ctx.fill();
-
-      ctx.globalAlpha = 0.95;
-      ctx.strokeStyle = player.color;
-      ctx.lineWidth = 4 + pulse;
+      ctx.moveTo(-10, 0);
+      ctx.lineTo(8, 0);
       ctx.stroke();
 
-      ctx.fillStyle = '#ffffff';
-      ctx.globalAlpha = 0.8;
+      // Core white laser
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 1.8;
       ctx.beginPath();
-      ctx.arc(x, y, 6, 0, Math.PI * 2);
+      ctx.moveTo(-6, 0);
+      ctx.lineTo(8, 0);
+      ctx.stroke();
+
+      ctx.restore();
+    }
+  }
+
+  drawShips(ctx) {
+    for (const player of this.players.values()) {
+      if (!player.isAlive) continue;
+
+      ctx.save();
+      ctx.translate(player.x, player.y);
+      ctx.rotate(player.angle);
+
+      // --- 1. Thruster Plume Flame ---
+      if (player.thrusting) {
+        const flameLength = 16 + Math.random() * 12;
+        ctx.save();
+        ctx.beginPath();
+        ctx.moveTo(-10, -5);
+        ctx.lineTo(-10 - flameLength, 0);
+        ctx.lineTo(-10, 5);
+        ctx.closePath();
+
+        ctx.fillStyle = '#ff7700';
+        ctx.shadowColor = '#ff5500';
+        ctx.shadowBlur = 16;
+        ctx.fill();
+
+        // Inner white/cyan core
+        ctx.beginPath();
+        ctx.moveTo(-9, -2.5);
+        ctx.lineTo(-9 - flameLength * 0.55, 0);
+        ctx.lineTo(-9, 2.5);
+        ctx.closePath();
+        ctx.fillStyle = '#ffffff';
+        ctx.fill();
+        ctx.restore();
+      }
+
+      // --- 2. Crude Triangle Spaceship ---
+      // Classic vector ship: nose at (24, 0), right wing at (-16, 14), indent at (-8, 0), left wing at (-16, -14)
+      ctx.beginPath();
+      ctx.moveTo(24, 0);      // Front nose
+      ctx.lineTo(-16, 14);    // Right wing
+      ctx.lineTo(-8, 0);      // Rear indent
+      ctx.lineTo(-16, -14);   // Left wing
+      ctx.closePath();
+
+      // Translucent cockpit dark fill
+      ctx.fillStyle = 'rgba(10, 14, 24, 0.9)';
       ctx.fill();
 
-      ctx.shadowBlur = 4;
-      ctx.fillStyle = '#ffffff';
-      ctx.font = 'bold 15px "Segoe UI", Roboto, sans-serif';
-      ctx.textAlign = 'center';
-      ctx.fillText(player.name, x, y - r - 12);
+      // Neon vector outline
+      ctx.strokeStyle = player.color;
+      ctx.lineWidth = 2.6;
+      ctx.shadowColor = player.color;
+      ctx.shadowBlur = player.isLocal ? 16 : 8;
+      ctx.stroke();
 
+      // --- 3. Invulnerability Shield ---
+      if (player.shieldTimer > 0) {
+        const pulse = Math.sin(performance.now() * 0.015) * 0.2 + 0.8;
+        ctx.beginPath();
+        ctx.arc(0, 0, this.SHIP_RADIUS + 9, 0, Math.PI * 2);
+        ctx.strokeStyle = `rgba(0, 240, 255, ${pulse * 0.85})`;
+        ctx.lineWidth = 2.5;
+        ctx.shadowColor = '#00f0ff';
+        ctx.shadowBlur = 14;
+        ctx.stroke();
+      }
+
+      ctx.restore();
+
+      // --- 4. Player Name & Score Tag ---
+      ctx.save();
+      ctx.font = 'bold 13px "Segoe UI", Roboto, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#ffffff';
+      ctx.shadowColor = '#000000';
+      ctx.shadowBlur = 6;
+      ctx.fillText(`${player.name} (${player.score})`, player.x, player.y - 28);
+      ctx.restore();
+    }
+  }
+
+  drawParticles(ctx) {
+    for (const p of this.particles) {
+      ctx.save();
+      ctx.globalAlpha = Math.max(0, p.alpha);
+      ctx.shadowColor = p.color;
+      ctx.shadowBlur = 6;
+
+      if (p.type === 'line') {
+        ctx.translate(p.x, p.y);
+        ctx.rotate(p.angle);
+        ctx.strokeStyle = p.color;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(-p.length / 2, 0);
+        ctx.lineTo(p.length / 2, 0);
+        ctx.stroke();
+      } else {
+        ctx.fillStyle = p.color;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      ctx.restore();
+    }
+  }
+
+  drawFloatingTexts(ctx) {
+    for (const ft of this.floatingTexts) {
+      ctx.save();
+      ctx.font = 'bold 18px "Segoe UI", Roboto, sans-serif';
+      ctx.fillStyle = ft.color;
+      ctx.globalAlpha = Math.max(0, ft.alpha);
+      ctx.textAlign = 'center';
+      ctx.shadowColor = '#000';
+      ctx.shadowBlur = 8;
+      ctx.fillText(ft.text, ft.x, ft.y);
       ctx.restore();
     }
   }
@@ -653,20 +1044,26 @@ class GameEngine {
     ctx.shadowColor = '#00f0ff';
     ctx.shadowBlur = 30;
 
-    const text = this.countdown > 0 ? this.countdown : 'CLASH!';
+    const text = this.countdown > 0 ? this.countdown : 'LAUNCH!';
     ctx.fillText(text, this.V_WIDTH / 2, this.V_HEIGHT / 2);
-
     ctx.restore();
   }
 
   reset() {
-    this.territories = [];
+    this.asteroids = [];
+    this.bullets = [];
     this.particles = [];
-    this.ripples = [];
     this.floatingTexts = [];
-    this.coverageStats = {};
     for (const p of this.players.values()) {
-      p.expanding = null;
+      p.score = 0;
+      p.kills = 0;
+      p.deaths = 0;
+      p.vx = 0;
+      p.vy = 0;
+      p.angle = -Math.PI / 2;
+      p.isAlive = true;
+      p.shieldTimer = 3.0;
+      p.thrusting = false;
     }
   }
 }
