@@ -1,50 +1,53 @@
 /**
  * Circle Clash - Territory Conquest Game Engine
- * Manages canvas rendering, physics, collision detection, and territory coverage.
+ * 60 FPS HTML5 Canvas engine with authoritative collision detection and territory tracking.
  */
 class GameEngine {
   constructor(canvas) {
     this.canvas = canvas;
     this.ctx = canvas.getContext('2d');
 
-    // Virtual Arena Resolution
+    // Virtual Arena Resolution (16:9)
     this.V_WIDTH = 1600;
     this.V_HEIGHT = 900;
     this.scale = 1;
     this.offsetX = 0;
     this.offsetY = 0;
 
-    // Game Config
+    // Game Tuning
     this.GROWTH_RATE = 110; // pixels per second
     this.MAX_RADIUS = 280;  // maximum circle radius
-    this.MIN_RADIUS = 20;   // minimum circle radius to claim
+    this.MIN_RADIUS = 20;   // minimum circle radius to claim territory
 
     // State
     this.state = 'LOBBY'; // LOBBY, COUNTDOWN, PLAYING, GAME_OVER
     this.players = new Map(); // id -> Player
     this.localPlayerId = null;
     this.territories = []; // array of { id, playerId, color, x, y, r, timestamp }
-    this.tickEvents = []; // multicast events for host
     this.particles = [];
     this.ripples = [];
     this.floatingTexts = [];
     this.screenShake = 0;
 
     // Coverage & Timers
-    this.coverageStats = {}; // playerId -> percentage
+    this.coverageStats = {}; // playerId -> percentage string
     this.timeRemaining = 60;
     this.matchDuration = 60;
     this.countdown = 3;
+
+    // Off-screen canvas for real-time territory coverage calculation
     this.coverageCanvas = document.createElement('canvas');
     this.coverageCanvas.width = 160;
     this.coverageCanvas.height = 90;
     this.coverageCtx = this.coverageCanvas.getContext('2d', { willReadFrequently: true });
     this.lastCoverageCheck = 0;
 
-    // Bot AI loop timer
-    this.botTimer = null;
+    // Event hooks for Host broadcasts
+    this.onBotExpandStart = null;
+    this.onBotExpandStop = null;
+    this.onPlayerPop = null;
 
-    // Animation loop binding
+    // Loop
     this.lastFrameTime = performance.now();
     this.rafId = null;
 
@@ -64,7 +67,6 @@ class GameEngine {
     this.canvas.width = windowW * dpr;
     this.canvas.height = windowH * dpr;
 
-    // Scale maintaining 16:9 aspect ratio with letterboxing
     const scaleX = (windowW * dpr) / this.V_WIDTH;
     const scaleY = (windowH * dpr) / this.V_HEIGHT;
     this.scale = Math.min(scaleX, scaleY);
@@ -73,7 +75,6 @@ class GameEngine {
     this.offsetY = (this.canvas.height - this.V_HEIGHT * this.scale) / 2;
   }
 
-  // Convert client screen mouse/touch coords to virtual game arena coords
   screenToVirtual(screenX, screenY) {
     const dpr = window.devicePixelRatio || 1;
     const canvasX = screenX * dpr - this.offsetX;
@@ -102,15 +103,16 @@ class GameEngine {
     this.players.set(playerData.id, {
       ...existing,
       ...playerData,
-      expanding: playerData.expanding || existing.expanding || null
+      expanding: existing.expanding || null
     });
   }
 
   removePlayer(playerId) {
+    this.stopExpand(playerId);
     this.players.delete(playerId);
   }
 
-  // --- EXPANSION & MECHANICS ---
+  // --- EXPANSION & TERRITORY LIFECYCLE ---
 
   startExpand(playerId, x, y) {
     if (this.state !== 'PLAYING') return;
@@ -118,10 +120,9 @@ class GameEngine {
     if (!player) return;
 
     player.expanding = {
-      x,
-      y,
+      x: Math.round(x),
+      y: Math.round(y),
       r: 10,
-      startTime: performance.now(),
       maxR: this.MAX_RADIUS
     };
 
@@ -130,7 +131,7 @@ class GameEngine {
     }
   }
 
-  stopExpandLocally(playerId) {
+  stopExpand(playerId) {
     const player = this.players.get(playerId);
     if (player) {
       player.expanding = null;
@@ -140,17 +141,17 @@ class GameEngine {
     }
   }
 
-  commitTerritory(territory) {
+  claimTerritory(territory) {
     if (!territory) return;
-    // Prevent duplicate territory insertion
+    // Deduplicate
     if (this.territories.some(t => t.id === territory.id)) return;
 
     this.territories.push(territory);
 
-    // Make sure expanding state is cleared for the player who claimed it
-    this.stopExpandLocally(territory.playerId);
+    // Guaranteed cleanup for that player's expanding state
+    this.stopExpand(territory.playerId);
 
-    // Add shockwave ripple
+    // Shockwave ripple
     this.ripples.push({
       x: territory.x,
       y: territory.y,
@@ -165,146 +166,13 @@ class GameEngine {
     }
   }
 
-  reconcileActiveExpanding(activeList = []) {
-    const activeMap = new Map();
-    for (const item of activeList) {
-      activeMap.set(item.playerId, item);
-    }
-
-    for (const player of this.players.values()) {
-      const isLocal = (player.id === this.localPlayerId);
-      const hostItem = activeMap.get(player.id);
-
-      if (!hostItem) {
-        // Authoritative Host says this player is NOT expanding
-        if (!isLocal && player.expanding) {
-          player.expanding = null;
-          if (window.soundManager) {
-            window.soundManager.stopExpandSound(player.id);
-          }
-        }
-      } else {
-        // Authoritative Host says this player IS expanding
-        if (!isLocal) {
-          if (!player.expanding) {
-            player.expanding = {
-              x: hostItem.x,
-              y: hostItem.y,
-              r: hostItem.r,
-              maxR: this.MAX_RADIUS
-            };
-            if (window.soundManager) {
-              window.soundManager.startExpandSound(player.id);
-            }
-          } else {
-            // Smoothly align radius with authoritative host
-            player.expanding.r = player.expanding.r * 0.3 + hostItem.r * 0.7;
-            player.expanding.x = hostItem.x;
-            player.expanding.y = hostItem.y;
-          }
-        }
-      }
-    }
-  }
-
-  // --- HOST MULTICAST SYSTEM ---
-  generateHostTick() {
-    const activeExpanding = [];
-    for (const p of this.players.values()) {
-      if (p.expanding) {
-        activeExpanding.push({
-          id: p.id,
-          x: Math.round(p.expanding.x),
-          y: Math.round(p.expanding.y),
-          r: Math.round(p.expanding.r)
-        });
-      }
-    }
-
-    const events = [...this.tickEvents];
-    this.tickEvents = []; // Flush events for next tick
-
-    return {
-      time: this.timeRemaining,
-      scores: this.coverageStats,
-      expanding: activeExpanding,
-      events
-    };
-  }
-
-  applyHostTick(tick) {
-    if (!tick) return;
-
-    if (typeof tick.time === 'number') {
-      this.timeRemaining = tick.time;
-    }
-    if (tick.scores) {
-      this.coverageStats = tick.scores;
-    }
-
-    // 1. Process discrete host events (claim, pop)
-    if (tick.events && Array.isArray(tick.events)) {
-      for (const ev of tick.events) {
-        if (ev.type === 'claim' && ev.territory) {
-          this.commitTerritory(ev.territory);
-        } else if (ev.type === 'pop') {
-          this.popPlayer(ev.playerId, ev.x, ev.y, ev.r);
-        }
-      }
-    }
-
-    // 2. Multicast active expanding circles
-    const activeMap = new Map();
-    if (tick.expanding && Array.isArray(tick.expanding)) {
-      for (const item of tick.expanding) {
-        activeMap.set(item.id, item);
-      }
-    }
-
-    for (const player of this.players.values()) {
-      const hostItem = activeMap.get(player.id);
-
-      if (!hostItem) {
-        // Player is NOT expanding according to host authoritative simulation
-        if (player.expanding) {
-          player.expanding = null;
-          if (window.soundManager) {
-            window.soundManager.stopExpandSound(player.id);
-          }
-        }
-      } else {
-        // Player IS expanding according to host
-        if (!player.expanding) {
-          player.expanding = {
-            x: hostItem.x,
-            y: hostItem.y,
-            r: hostItem.r,
-            maxR: this.MAX_RADIUS
-          };
-          if (window.soundManager) {
-            window.soundManager.startExpandSound(player.id);
-          }
-        } else {
-          // Smooth interpolation
-          player.expanding.r = player.expanding.r * 0.3 + hostItem.r * 0.7;
-          player.expanding.x = hostItem.x;
-          player.expanding.y = hostItem.y;
-        }
-      }
-    }
-  }
-
   releaseExpand(playerId) {
     if (this.state !== 'PLAYING') return null;
     const player = this.players.get(playerId);
     if (!player || !player.expanding) return null;
 
     const { x, y, r } = player.expanding;
-    player.expanding = null;
-
-    if (window.soundManager) {
-      window.soundManager.stopExpandSound(playerId);
-    }
+    this.stopExpand(playerId);
 
     if (r >= this.MIN_RADIUS) {
       const territory = {
@@ -313,55 +181,30 @@ class GameEngine {
         color: player.color,
         x,
         y,
-        r,
+        r: Math.round(r),
         timestamp: Date.now()
       };
 
-      this.territories.push(territory);
-
-      // Add shockwave ripple
-      this.ripples.push({
-        x,
-        y,
-        r,
-        maxR: r + 35,
-        color: player.color,
-        alpha: 0.8
-      });
-
-      if (window.soundManager) {
-        window.soundManager.playClaim(r);
-      }
-
-      // Record event for host multicast
-      this.tickEvents.push({ type: 'claim', territory });
-
+      this.claimTerritory(territory);
       return territory;
     }
     return null;
   }
 
-  popPlayer(playerId, x, y, radius, cause = 'collision') {
+  popPlayer(playerId, x, y, radius) {
     const player = this.players.get(playerId);
     if (!player) return;
 
-    player.expanding = null;
+    this.stopExpand(playerId);
 
     if (window.soundManager) {
-      window.soundManager.stopExpandSound(playerId);
       window.soundManager.playPop();
     }
 
-    // Record pop event for host multicast
-    this.tickEvents.push({ type: 'pop', playerId, x, y, r: radius });
-
-    // Spawn sparks / pop particles
+    // Explosion sparks
     this.createExplosion(x, y, player.color, Math.min(45, Math.max(16, radius / 3)));
-
-    // Camera shake
     this.screenShake = Math.min(18, 6 + radius * 0.06);
 
-    // Floating POP text
     this.floatingTexts.push({
       x,
       y: y - 20,
@@ -397,7 +240,6 @@ class GameEngine {
     const botColors = ['#00f0ff', '#ff0077', '#39ff14', '#ffe600', '#bf00ff', '#ff5722'];
     const botNames = ['PixelBot', 'NexusAI', 'Vortex', 'Echo', 'NeonDrift', 'Blitz'];
 
-    // Pick unused color/name if possible
     const usedColors = new Set([...this.players.values()].map(p => p.color));
     const availableColors = botColors.filter(c => !usedColors.has(c));
     const botColor = availableColors[0] || botColors[Math.floor(Math.random() * botColors.length)];
@@ -428,14 +270,12 @@ class GameEngine {
       if (!player.isBot) continue;
 
       if (player.botState === 'IDLE' && now >= player.botTimer) {
-        // Pick smart placement: random position away from arena edges
         const padding = 120;
         const x = padding + Math.random() * (this.V_WIDTH - padding * 2);
         const y = padding + Math.random() * (this.V_HEIGHT - padding * 2);
 
         this.startExpand(player.id, x, y);
         player.botState = 'GROWING';
-        // Target hold duration: 0.8 to 2.2 seconds
         player.botHoldDuration = 800 + Math.random() * 1400;
         player.botExpandStartTime = now;
 
@@ -445,7 +285,7 @@ class GameEngine {
       } else if (player.botState === 'GROWING' && player.expanding) {
         const elapsed = now - player.botExpandStartTime;
 
-        // Check if any opponent expanding circle is getting dangerously close
+        // Emergency release if an opponent gets close
         let emergencyRelease = false;
         for (const other of this.players.values()) {
           if (other.id !== player.id && other.expanding) {
@@ -464,8 +304,8 @@ class GameEngine {
           player.botState = 'IDLE';
           player.botTimer = now + 400 + Math.random() * 1200;
 
-          if (this.onBotExpandRelease) {
-            this.onBotExpandRelease(player.id, territory);
+          if (this.onBotExpandStop) {
+            this.onBotExpandStop(player.id, territory);
           }
         }
       }
@@ -487,7 +327,6 @@ class GameEngine {
         const dist = Math.sqrt(dx * dx + dy * dy);
 
         if (dist < (p1.expanding.r + p2.expanding.r)) {
-          // Touch! Both pop!
           poppedIds.add(p1.id);
           poppedIds.add(p2.id);
         }
@@ -498,46 +337,40 @@ class GameEngine {
       const p = this.players.get(id);
       if (p && p.expanding) {
         const { x, y, r } = p.expanding;
-        this.popPlayer(id, x, y, r, 'collision');
+        this.popPlayer(id, x, y, r);
 
-        if (this.onPlayerPopped) {
-          this.onPlayerPopped(id, x, y, r);
+        if (this.onPlayerPop) {
+          this.onPlayerPop(id, x, y, r);
         }
       }
     }
   }
 
-  // --- TERRITORY COVERAGE TRACKER ---
+  // --- COVERAGE CALCULATION ---
   updateCoverage() {
     const w = this.coverageCanvas.width;
     const h = this.coverageCanvas.height;
     const scaleX = w / this.V_WIDTH;
     const scaleY = h / this.V_HEIGHT;
 
-    // Draw background neutral color
     this.coverageCtx.fillStyle = '#000000';
     this.coverageCtx.fillRect(0, 0, w, h);
 
-    // Map each player to unique color index for fast pixel lookup
     const colorMap = new Map();
     let idx = 1;
     for (const player of this.players.values()) {
-      colorMap.set(player.id, idx);
-      idx++;
+      colorMap.set(player.id, idx++);
     }
 
-    // Render placed territories in order onto low-res canvas
     for (const t of this.territories) {
       const mappedId = colorMap.get(t.playerId);
       if (!mappedId) continue;
-
       this.coverageCtx.fillStyle = `rgb(${mappedId}, 0, 0)`;
       this.coverageCtx.beginPath();
       this.coverageCtx.arc(t.x * scaleX, t.y * scaleY, t.r * scaleX, 0, Math.PI * 2);
       this.coverageCtx.fill();
     }
 
-    // Count pixels
     const imgData = this.coverageCtx.getImageData(0, 0, w, h).data;
     const totalPixels = w * h;
     const pixelCounts = {};
@@ -549,17 +382,15 @@ class GameEngine {
       }
     }
 
-    // Compute percentage per player
     const stats = {};
     for (const [playerId, mappedId] of colorMap.entries()) {
       const count = pixelCounts[mappedId] || 0;
       stats[playerId] = ((count / totalPixels) * 100).toFixed(1);
     }
-
     this.coverageStats = stats;
   }
 
-  // --- MAIN LOOP ---
+  // --- GAME LOOP ---
   startLoop() {
     if (this.rafId) cancelAnimationFrame(this.rafId);
     const loop = (now) => {
@@ -580,9 +411,17 @@ class GameEngine {
   }
 
   update(now, dt) {
-    // 1. Update expanding circles smoothly using delta time
     if (this.state === 'PLAYING') {
+      // 1. Expand active circles
       for (const player of this.players.values()) {
+        // Invariant: Local player can NEVER expand if user is not currently holding input!
+        if (player.id === this.localPlayerId && !window.isUserHolding) {
+          if (player.expanding) {
+            this.stopExpand(player.id);
+          }
+          continue;
+        }
+
         if (player.expanding) {
           player.expanding.r = Math.min(
             player.expanding.maxR,
@@ -591,20 +430,20 @@ class GameEngine {
         }
       }
 
-      // 2. Collision checks (Only Host or Local game runs authoritative collision)
+      // 2. Host-authoritative collisions and bot AI
       if (!window.networkManager || window.networkManager.isHost) {
         this.checkExpandingCollisions();
         this.updateBots(now);
       }
 
-      // 3. Periodic Territory Coverage check (every 300ms)
+      // 3. Periodic Coverage Check
       if (now - this.lastCoverageCheck > 300) {
         this.updateCoverage();
         this.lastCoverageCheck = now;
       }
     }
 
-    // 4. Update particles
+    // Update particles
     for (let i = this.particles.length - 1; i >= 0; i--) {
       const p = this.particles[i];
       p.x += p.vx;
@@ -618,7 +457,7 @@ class GameEngine {
       }
     }
 
-    // 5. Update shockwave ripples
+    // Update ripples
     for (let i = this.ripples.length - 1; i >= 0; i--) {
       const r = this.ripples[i];
       r.r += 2.5;
@@ -628,7 +467,7 @@ class GameEngine {
       }
     }
 
-    // 6. Update floating texts
+    // Update floating texts
     for (let i = this.floatingTexts.length - 1; i >= 0; i--) {
       const ft = this.floatingTexts[i];
       ft.y += ft.vy;
@@ -639,7 +478,7 @@ class GameEngine {
       }
     }
 
-    // 7. Screen shake decay
+    // Screen shake
     if (this.screenShake > 0) {
       this.screenShake = Math.max(0, this.screenShake - dt * 25);
     }
@@ -650,11 +489,10 @@ class GameEngine {
     const ctx = this.ctx;
     ctx.save();
 
-    // Clear whole screen with deep void background
+    // Void background
     ctx.fillStyle = '#080a10';
     ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
 
-    // Apply arena transform & screen shake
     ctx.translate(this.offsetX, this.offsetY);
     ctx.scale(this.scale, this.scale);
 
@@ -664,13 +502,13 @@ class GameEngine {
       ctx.translate(shakeX, shakeY);
     }
 
-    // 1. Draw Arena Boundary & Grid
+    // 1. Grid & Borders
     this.drawArenaGrid(ctx);
 
-    // 2. Draw Claimed Territories
+    // 2. Claimed Territories
     this.drawTerritories(ctx);
 
-    // 3. Draw Shockwave Ripples
+    // 3. Shockwave Ripples
     for (const rip of this.ripples) {
       ctx.strokeStyle = rip.color;
       ctx.globalAlpha = Math.max(0, rip.alpha);
@@ -681,10 +519,10 @@ class GameEngine {
     }
     ctx.globalAlpha = 1;
 
-    // 4. Draw Expanding Circles (Glowing & Pulsing)
+    // 4. Expanding Circles
     this.drawExpandingCircles(ctx);
 
-    // 5. Draw Particles
+    // 5. Particles
     for (const p of this.particles) {
       ctx.fillStyle = p.color;
       ctx.globalAlpha = Math.max(0, p.alpha);
@@ -697,7 +535,7 @@ class GameEngine {
     ctx.shadowBlur = 0;
     ctx.globalAlpha = 1;
 
-    // 6. Draw Floating Texts
+    // 6. Floating texts
     for (const ft of this.floatingTexts) {
       ctx.font = 'bold 22px "Segoe UI", Roboto, sans-serif';
       ctx.fillStyle = ft.color;
@@ -710,7 +548,7 @@ class GameEngine {
     ctx.shadowBlur = 0;
     ctx.globalAlpha = 1;
 
-    // 7. Draw Countdown Overlay if Starting
+    // 7. Countdown
     if (this.state === 'COUNTDOWN') {
       this.drawCountdownOverlay(ctx);
     }
@@ -719,11 +557,9 @@ class GameEngine {
   }
 
   drawArenaGrid(ctx) {
-    // Arena background box
     ctx.fillStyle = '#0d111a';
     ctx.fillRect(0, 0, this.V_WIDTH, this.V_HEIGHT);
 
-    // Subtle neon grid lines
     ctx.strokeStyle = 'rgba(255, 255, 255, 0.04)';
     ctx.lineWidth = 1;
     const gridSize = 50;
@@ -739,7 +575,6 @@ class GameEngine {
     }
     ctx.stroke();
 
-    // Arena glowing border
     ctx.strokeStyle = 'rgba(0, 240, 255, 0.4)';
     ctx.shadowColor = '#00f0ff';
     ctx.shadowBlur = 12;
@@ -758,7 +593,6 @@ class GameEngine {
       ctx.arc(t.x, t.y, t.r, 0, Math.PI * 2);
       ctx.fill();
 
-      // Border highlight
       ctx.strokeStyle = 'rgba(255, 255, 255, 0.35)';
       ctx.lineWidth = 2;
       ctx.stroke();
@@ -777,32 +611,26 @@ class GameEngine {
       const pulse = Math.sin(now * 0.015) * 3;
 
       ctx.save();
-
-      // Outer glow aura
       ctx.shadowColor = player.color;
       ctx.shadowBlur = 18;
 
-      // Translucent expanding body
       ctx.fillStyle = player.color;
       ctx.globalAlpha = 0.35;
       ctx.beginPath();
       ctx.arc(x, y, r, 0, Math.PI * 2);
       ctx.fill();
 
-      // Vibrant pulsing border
       ctx.globalAlpha = 0.95;
       ctx.strokeStyle = player.color;
       ctx.lineWidth = 4 + pulse;
       ctx.stroke();
 
-      // Inner energy core
       ctx.fillStyle = '#ffffff';
       ctx.globalAlpha = 0.8;
       ctx.beginPath();
       ctx.arc(x, y, 6, 0, Math.PI * 2);
       ctx.fill();
 
-      // Player name tag above expanding bubble
       ctx.shadowBlur = 4;
       ctx.fillStyle = '#ffffff';
       ctx.font = 'bold 15px "Segoe UI", Roboto, sans-serif';
@@ -833,7 +661,6 @@ class GameEngine {
 
   reset() {
     this.territories = [];
-    this.tickEvents = [];
     this.particles = [];
     this.ripples = [];
     this.floatingTexts = [];

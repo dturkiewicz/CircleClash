@@ -60,14 +60,13 @@ document.addEventListener('DOMContentLoaded', () => {
   const PALETTE = ['#00f0ff', '#ff0077', '#39ff14', '#ffe600', '#bf00ff', '#ff5722'];
   let selectedColor = PALETTE[0];
 
-  // Current session info
+  // Session
   let myPlayerId = 'p_' + Math.random().toString(36).substring(2, 8);
   let isSoloMode = false;
   let matchInterval = null;
-  let isHolding = false;
-  let holdVirtualPos = null;
+  window.isUserHolding = false;
 
-  // --- 1. SETUP PALETTE & LOCAL STORAGE ---
+  // --- 1. SETUP PALETTE & STORAGE ---
   function initPlayerSetup() {
     const savedName = localStorage.getItem('circle_clash_name');
     playerNameInput.value = savedName || ('Player_' + Math.floor(10 + Math.random() * 90));
@@ -89,7 +88,6 @@ document.addEventListener('DOMContentLoaded', () => {
       colorPicker.appendChild(swatch);
     });
 
-    // Check URL parameters for direct room join
     const params = new URLSearchParams(window.location.search);
     const roomParam = params.get('room');
     if (roomParam) {
@@ -116,7 +114,7 @@ document.addEventListener('DOMContentLoaded', () => {
   tabJoin.addEventListener('click', () => switchTab('join'));
   tabSolo.addEventListener('click', () => switchTab('solo'));
 
-  // --- 3. AUDIO & MUTE CONTROLS ---
+  // --- 3. AUDIO CONTROLS ---
   function updateMuteButton() {
     btnMute.textContent = window.soundManager.isMuted ? '🔇' : '🔊';
   }
@@ -127,7 +125,7 @@ document.addEventListener('DOMContentLoaded', () => {
     updateMuteButton();
   });
 
-  // --- 4. LOBBY PLAYERS LIST UI ---
+  // --- 4. LOBBY LIST ---
   function refreshLobbyPlayersList() {
     lobbyPlayersList.innerHTML = '';
     playerCount.textContent = game.players.size;
@@ -173,7 +171,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  // --- 5. HOSTING A GAME ---
+  // --- 5. HOSTING ---
   btnCreateRoom.addEventListener('click', async () => {
     const name = playerNameInput.value.trim() || 'Host';
     btnCreateRoom.disabled = true;
@@ -188,7 +186,6 @@ document.addEventListener('DOMContentLoaded', () => {
         isHost: true
       });
 
-      // Update Engine
       game.initLocalPlayer({
         id: myPlayerId,
         peerId: res.peerId,
@@ -214,7 +211,6 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
 
-  // Copy Invite Link
   btnCopyInvite.addEventListener('click', () => {
     const code = displayRoomCode.textContent;
     const url = `${window.location.origin}${window.location.pathname}?room=${code}`;
@@ -236,54 +232,109 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
 
-  // Add Practice Bot (in Host lobby)
   btnAddBot.addEventListener('click', () => {
     if (game.players.size >= 8) return;
     const bot = game.addBot();
     refreshLobbyPlayersList();
 
     window.networkManager.broadcast({
-      type: 'player_joined',
+      type: 'PLAYER_JOINED',
       player: bot
     });
   });
 
   function setupHostNetworkHandlers() {
-    window.networkManager.on('client_join_request', ({ peerId, player, sendAccept }) => {
-      player.peerId = peerId;
+    // Bot events replicate directly to all connected clients
+    game.onBotExpandStart = (botId, x, y) => {
+      window.networkManager.broadcast({
+        type: 'EXPAND_START',
+        playerId: botId,
+        x,
+        y
+      });
+    };
+
+    game.onBotExpandStop = (botId, territory) => {
+      window.networkManager.broadcast({
+        type: 'EXPAND_RELEASE',
+        playerId: botId,
+        territory
+      });
+    };
+
+    game.onPlayerPop = (playerId, x, y, r) => {
+      window.networkManager.broadcast({
+        type: 'PLAYER_POPPED',
+        playerId,
+        x,
+        y,
+        r
+      });
+    };
+
+    // Client requests to join
+    window.networkManager.on('JOIN_REQUEST', (msg) => {
+      const player = msg.player;
+      player.peerId = msg.fromPeerId;
       game.addOrUpdatePlayer(player);
       refreshLobbyPlayersList();
 
-      sendAccept({
-        players: Array.from(game.players.values()),
-        territories: game.territories,
-        duration: parseInt(matchDurationSelect.value, 10)
+      // Accept client and send current state
+      window.networkManager.sendTo(msg.fromPeerId, {
+        type: 'JOIN_ACCEPTED',
+        gameState: {
+          players: Array.from(game.players.values()),
+          territories: game.territories,
+          duration: parseInt(matchDurationSelect.value, 10)
+        }
       });
+
+      // Notify other clients
+      window.networkManager.broadcast({
+        type: 'PLAYER_JOINED',
+        player
+      }, msg.fromPeerId);
     });
 
-    window.networkManager.on('player_disconnected', ({ peerId }) => {
+    window.networkManager.on('PLAYER_LEFT', (msg) => {
       for (const [id, p] of game.players.entries()) {
-        if (p.peerId === peerId) {
-          game.stopExpandLocally(id);
+        if (p.peerId === msg.peerId) {
           game.removePlayer(id);
           break;
         }
       }
       refreshLobbyPlayersList();
+      window.networkManager.broadcast({
+        type: 'PLAYER_LEFT',
+        peerId: msg.peerId
+      });
     });
 
-    // Client requests expansion start -> Host executes authoritative simulation
-    window.networkManager.on('client_input_down', ({ peerId, data }) => {
-      game.startExpand(data.playerId, data.x, data.y);
+    // Client starts expansion
+    window.networkManager.on('EXPAND_START', (msg) => {
+      game.startExpand(msg.playerId, msg.x, msg.y);
+      // Replicate to all other clients
+      window.networkManager.broadcast({
+        type: 'EXPAND_START',
+        playerId: msg.playerId,
+        x: msg.x,
+        y: msg.y
+      }, msg.fromPeerId);
     });
 
-    // Client requests expansion release -> Host executes authoritative simulation & claims territory
-    window.networkManager.on('client_input_up', ({ peerId, data }) => {
-      game.releaseExpand(data.playerId);
+    // Client releases expansion -> Host authoritatively locks territory
+    window.networkManager.on('REQUEST_RELEASE', (msg) => {
+      const territory = game.releaseExpand(msg.playerId);
+      // Broadcast release event (with territory if successfully claimed) to ALL clients
+      window.networkManager.broadcast({
+        type: 'EXPAND_RELEASE',
+        playerId: msg.playerId,
+        territory
+      });
     });
   }
 
-  // --- 6. JOINING A GAME ---
+  // --- 6. JOINING ---
   btnJoinRoom.addEventListener('click', async () => {
     const code = roomCodeInput.value.trim().toUpperCase();
     if (!code || code.length < 3) {
@@ -306,7 +357,6 @@ document.addEventListener('DOMContentLoaded', () => {
         isHost: false
       });
 
-      // Initialize game state with host data
       game.initLocalPlayer({
         id: myPlayerId,
         peerId: window.networkManager.myId,
@@ -317,7 +367,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
       hudRoomCode.textContent = code;
 
-      // Populate other players
       if (gameState && gameState.players) {
         for (const p of gameState.players) {
           game.addOrUpdatePlayer(p);
@@ -335,41 +384,60 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   function setupClientNetworkHandlers() {
-    window.networkManager.on('player_joined', (player) => {
-      game.addOrUpdatePlayer(player);
+    window.networkManager.on('PLAYER_JOINED', (msg) => {
+      game.addOrUpdatePlayer(msg.player);
     });
 
-    window.networkManager.on('player_left', ({ peerId }) => {
+    window.networkManager.on('PLAYER_LEFT', (msg) => {
       for (const [id, p] of game.players.entries()) {
-        if (p.peerId === peerId) {
-          game.stopExpandLocally(id);
+        if (p.peerId === msg.peerId) {
           game.removePlayer(id);
           break;
         }
       }
     });
 
-    window.networkManager.on('game_start', (settings) => {
-      startMatchSequence(settings.duration);
+    window.networkManager.on('GAME_START', (msg) => {
+      startMatchSequence(msg.duration);
     });
 
-    // Authoritative Host Multicast receiver:
-    window.networkManager.on('remote_host_tick', (tick) => {
-      game.applyHostTick(tick);
+    window.networkManager.on('EXPAND_START', (msg) => {
+      if (msg.playerId !== myPlayerId) {
+        game.startExpand(msg.playerId, msg.x, msg.y);
+      }
+    });
+
+    window.networkManager.on('EXPAND_RELEASE', (msg) => {
+      game.stopExpand(msg.playerId);
+      if (msg.territory) {
+        game.claimTerritory(msg.territory);
+      }
+    });
+
+    window.networkManager.on('PLAYER_POPPED', (msg) => {
+      game.popPlayer(msg.playerId, msg.x, msg.y, msg.r);
+      if (msg.playerId === myPlayerId) {
+        window.isUserHolding = false;
+      }
+    });
+
+    window.networkManager.on('TIME_SYNC', (msg) => {
+      game.timeRemaining = msg.time;
+      if (msg.scores) game.coverageStats = msg.scores;
       updateHudDisplay();
     });
 
-    window.networkManager.on('game_over', (results) => {
-      concludeMatch(results);
+    window.networkManager.on('GAME_OVER', (msg) => {
+      concludeMatch(msg.results);
     });
 
-    window.networkManager.on('host_disconnected', () => {
+    window.networkManager.on('HOST_DISCONNECTED', () => {
       alert('Host disconnected from the match.');
       returnToLobby();
     });
   }
 
-  // --- 7. SOLO PRACTICE MODE ---
+  // --- 7. SOLO PRACTICE ---
   btnStartSolo.addEventListener('click', () => {
     isSoloMode = true;
     window.soundManager.init();
@@ -385,7 +453,6 @@ document.addEventListener('DOMContentLoaded', () => {
       isHost: true
     });
 
-    // Add 2 bots for competition
     game.addBot();
     game.addBot();
 
@@ -397,8 +464,8 @@ document.addEventListener('DOMContentLoaded', () => {
   btnStartGame.addEventListener('click', () => {
     const duration = parseInt(matchDurationSelect.value, 10) || 60;
     window.networkManager.broadcast({
-      type: 'game_start',
-      settings: { duration }
+      type: 'GAME_START',
+      duration
     });
     startMatchSequence(duration);
   });
@@ -426,7 +493,6 @@ document.addEventListener('DOMContentLoaded', () => {
         clearInterval(countdownInterval);
         game.state = 'PLAYING';
 
-        // Host handles timer and sync
         if (isSoloMode || window.networkManager.isHost) {
           startHostGameTimer();
         }
@@ -434,24 +500,8 @@ document.addEventListener('DOMContentLoaded', () => {
     }, 1000);
   }
 
-  let tickInterval = null;
-
   function startHostGameTimer() {
     if (matchInterval) clearInterval(matchInterval);
-    if (tickInterval) clearInterval(tickInterval);
-
-    // Authoritative Host Multicast: 30 FPS tick rate
-    if (!isSoloMode && window.networkManager && window.networkManager.isHost) {
-      tickInterval = setInterval(() => {
-        if (game.state !== 'PLAYING') return;
-
-        const tickData = game.generateHostTick();
-        window.networkManager.broadcast({
-          type: 'host_tick',
-          tick: tickData
-        });
-      }, 35); // ~28-30 Hz
-    }
 
     matchInterval = setInterval(() => {
       if (game.state !== 'PLAYING') return;
@@ -459,17 +509,24 @@ document.addEventListener('DOMContentLoaded', () => {
       game.timeRemaining--;
       updateHudDisplay();
 
+      // Host periodically syncs time and scores to clients
+      if (!isSoloMode && window.networkManager && window.networkManager.isHost) {
+        window.networkManager.broadcast({
+          type: 'TIME_SYNC',
+          time: game.timeRemaining,
+          scores: game.coverageStats
+        });
+      }
+
       if (game.timeRemaining <= 0) {
         clearInterval(matchInterval);
-        if (tickInterval) clearInterval(tickInterval);
         game.updateCoverage();
 
-        // Calculate rankings
         const results = computeRankings();
 
         if (!isSoloMode && window.networkManager && window.networkManager.isHost) {
           window.networkManager.broadcast({
-            type: 'game_over',
+            type: 'GAME_OVER',
             results
           });
         }
@@ -497,7 +554,6 @@ document.addEventListener('DOMContentLoaded', () => {
   function concludeMatch(rankings) {
     game.state = 'GAME_OVER';
     if (matchInterval) clearInterval(matchInterval);
-    if (syncInterval) clearInterval(syncInterval);
     window.soundManager.stopAllExpands();
     window.soundManager.playVictory();
 
@@ -538,7 +594,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
     gameOverScreen.classList.remove('hidden');
 
-    // Only host or solo can click Play Again
     const canRestart = isSoloMode || (window.networkManager && window.networkManager.isHost);
     btnPlayAgain.style.display = canRestart ? 'flex' : 'none';
   }
@@ -547,8 +602,8 @@ document.addEventListener('DOMContentLoaded', () => {
     const duration = parseInt(matchDurationSelect.value, 10) || 60;
     if (!isSoloMode && window.networkManager.isHost) {
       window.networkManager.broadcast({
-        type: 'game_start',
-        settings: { duration }
+        type: 'GAME_START',
+        duration
       });
     }
     startMatchSequence(duration);
@@ -563,7 +618,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function returnToLobby() {
     if (matchInterval) clearInterval(matchInterval);
-    if (tickInterval) clearInterval(tickInterval);
     game.state = 'LOBBY';
     game.reset();
     window.soundManager.stopAllExpands();
@@ -589,7 +643,6 @@ document.addEventListener('DOMContentLoaded', () => {
       hudTimer.classList.remove('urgent');
     }
 
-    // Update territory bar & labels
     territoryBar.innerHTML = '';
     territoryLabels.innerHTML = '';
 
@@ -620,61 +673,74 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  // Periodically refresh HUD during render loop
   setInterval(() => {
     if (game.state === 'PLAYING') {
       updateHudDisplay();
     }
   }, 250);
 
-  // --- 10. USER INPUT HANDLERS (MOUSE, TOUCH, KEYBOARD) ---
+  // --- 10. INPUT HANDLERS ---
 
   function handleStart(clientX, clientY) {
     if (game.state !== 'PLAYING') return;
-    if (isHolding) return;
+    if (window.isUserHolding) return;
 
-    isHolding = true;
-    holdVirtualPos = game.screenToVirtual(clientX, clientY);
+    window.isUserHolding = true;
+    const pos = game.screenToVirtual(clientX, clientY);
 
-    if (isSoloMode || window.networkManager.isHost) {
-      // Host or solo executes directly in local simulation
-      game.startExpand(myPlayerId, holdVirtualPos.x, holdVirtualPos.y);
-    } else {
-      // Client immediately starts local expansion for zero input lag
-      game.startExpand(myPlayerId, holdVirtualPos.x, holdVirtualPos.y);
+    // 1. Immediately expand locally for 0ms lag
+    game.startExpand(myPlayerId, pos.x, pos.y);
 
-      // Client forwards input to authoritative host
-      window.networkManager.sendToHost({
-        type: 'input_down',
-        data: { playerId: myPlayerId, x: holdVirtualPos.x, y: holdVirtualPos.y }
-      });
+    // 2. Broadcast or send to host
+    if (!isSoloMode && window.networkManager) {
+      if (window.networkManager.isHost) {
+        window.networkManager.broadcast({
+          type: 'EXPAND_START',
+          playerId: myPlayerId,
+          x: pos.x,
+          y: pos.y
+        });
+      } else {
+        window.networkManager.sendToHost({
+          type: 'EXPAND_START',
+          playerId: myPlayerId,
+          x: pos.x,
+          y: pos.y
+        });
+      }
     }
   }
 
   function handleRelease() {
-    if (!isHolding) return;
-    isHolding = false;
+    if (!window.isUserHolding) return;
+    window.isUserHolding = false;
 
     if (game.state !== 'PLAYING') return;
 
-    if (isSoloMode || window.networkManager.isHost) {
-      // Host or solo executes release (multicast will broadcast claim event & cleared expanding state)
+    if (isSoloMode) {
       game.releaseExpand(myPlayerId);
+    } else if (window.networkManager.isHost) {
+      const territory = game.releaseExpand(myPlayerId);
+      window.networkManager.broadcast({
+        type: 'EXPAND_RELEASE',
+        playerId: myPlayerId,
+        territory
+      });
     } else {
-      // Client immediately clears local expanding state & audio
-      game.stopExpandLocally(myPlayerId);
+      // Client immediately stops expanding locally
+      game.stopExpand(myPlayerId);
 
-      // Client notifies authoritative host to release and claim territory
+      // Client requests authoritative host to release and claim
       window.networkManager.sendToHost({
-        type: 'input_up',
-        data: { playerId: myPlayerId }
+        type: 'REQUEST_RELEASE',
+        playerId: myPlayerId
       });
     }
   }
 
   // Mouse Listeners
   canvas.addEventListener('mousedown', (e) => {
-    if (e.button === 0) { // Left click
+    if (e.button === 0) {
       handleStart(e.clientX, e.clientY);
     }
   });
@@ -704,8 +770,6 @@ document.addEventListener('DOMContentLoaded', () => {
   window.addEventListener('keydown', (e) => {
     if (e.code === 'Space' && !e.repeat && document.activeElement.tagName !== 'INPUT') {
       e.preventDefault();
-      // Center of arena or current mouse position
-      const center = { x: game.V_WIDTH / 2, y: game.V_HEIGHT / 2 };
       handleStart(window.innerWidth / 2, window.innerHeight / 2);
     }
   });

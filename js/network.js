@@ -1,6 +1,6 @@
 /**
  * NetworkManager using PeerJS (WebRTC DataChannels)
- * Handles P2P room hosting, joining, state synchronization, and messaging.
+ * Simplified, reliable, flat-event networking layer.
  */
 class NetworkManager {
   constructor() {
@@ -8,23 +8,31 @@ class NetworkManager {
     this.isHost = false;
     this.roomCode = null;
     this.myId = null;
-    this.hostConn = null; // Client's connection to host
-    this.clients = new Map(); // Host's connections to clients: peerId -> conn
+    this.hostConn = null;
+    this.clients = new Map(); // peerId -> DataConnection
     this.callbacks = {};
     this.isConnected = false;
   }
 
   on(event, callback) {
-    this.callbacks[event] = callback;
+    if (!this.callbacks[event]) {
+      this.callbacks[event] = [];
+    }
+    this.callbacks[event].push(callback);
   }
 
   trigger(event, data) {
     if (this.callbacks[event]) {
-      this.callbacks[event](data);
+      for (const cb of this.callbacks[event]) {
+        try {
+          cb(data);
+        } catch (e) {
+          console.error(`Error in event listener for ${event}:`, e);
+        }
+      }
     }
   }
 
-  // Generate clean 5-character room code (avoiding ambiguous chars like 0, O, 1, I)
   generateRoomCode() {
     const chars = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
     let code = '';
@@ -38,14 +46,13 @@ class NetworkManager {
     return `cclash-${roomCode.toLowerCase()}`;
   }
 
-  // --- HOST A NEW GAME ---
+  // --- HOST GAME ---
   hostGame(playerInfo) {
     return new Promise((resolve, reject) => {
       this.isHost = true;
       this.roomCode = this.generateRoomCode();
       const hostPeerId = this.getPeerIdForRoom(this.roomCode);
 
-      // Create Peer using PeerJS public cloud signaling
       try {
         this.peer = new Peer(hostPeerId, {
           debug: 1,
@@ -63,92 +70,40 @@ class NetworkManager {
       this.peer.on('open', (id) => {
         this.myId = id;
         this.isConnected = true;
-        console.log(`[Host] Created room ${this.roomCode} with peer ID: ${id}`);
+        console.log(`[Host] Created room ${this.roomCode}`);
         resolve({ roomCode: this.roomCode, peerId: id });
       });
 
       this.peer.on('connection', (conn) => {
-        this.handleIncomingClientConnection(conn);
+        conn.on('open', () => {
+          this.clients.set(conn.peer, conn);
+
+          conn.on('data', (msg) => {
+            if (msg && msg.type) {
+              this.trigger(msg.type, { ...msg, fromPeerId: conn.peer });
+            }
+          });
+
+          conn.on('close', () => {
+            this.clients.delete(conn.peer);
+            this.trigger('PLAYER_LEFT', { peerId: conn.peer });
+          });
+        });
       });
 
       this.peer.on('error', (err) => {
         console.error('[Host] Peer error:', err);
         if (err.type === 'unavailable-id') {
-          // In rare case room code collided, retry with another code
           this.hostGame(playerInfo).then(resolve).catch(reject);
         } else {
-          this.trigger('error', { message: 'Peer connection error: ' + (err.message || err.type) });
+          this.trigger('ERROR', { message: err.message || err.type });
           reject(err);
         }
       });
     });
   }
 
-  handleIncomingClientConnection(conn) {
-    console.log(`[Host] Client connecting: ${conn.peer}`);
-
-    conn.on('open', () => {
-      this.clients.set(conn.peer, conn);
-
-      conn.on('data', (data) => {
-        this.handleClientMessage(conn.peer, data);
-      });
-
-      conn.on('close', () => {
-        console.log(`[Host] Client disconnected: ${conn.peer}`);
-        this.clients.delete(conn.peer);
-        this.trigger('player_disconnected', { peerId: conn.peer });
-        this.broadcast({
-          type: 'player_left',
-          peerId: conn.peer
-        });
-      });
-    });
-  }
-
-  handleClientMessage(fromPeerId, data) {
-    if (!data || !data.type) return;
-
-    switch (data.type) {
-      case 'join':
-        this.trigger('client_join_request', {
-          peerId: fromPeerId,
-          player: data.player,
-          sendAccept: (gameState) => {
-            this.sendTo(fromPeerId, {
-              type: 'joined_ok',
-              gameState
-            });
-            // Inform everyone else about new player
-            this.broadcast({
-              type: 'player_joined',
-              player: data.player
-            }, fromPeerId);
-          }
-        });
-        break;
-
-      case 'input_down':
-      case 'start_expand':
-        this.trigger('client_input_down', { peerId: fromPeerId, data: data.payload || data });
-        break;
-
-      case 'input_up':
-      case 'release_expand':
-        this.trigger('client_input_up', { peerId: fromPeerId, data: data.payload || data });
-        break;
-
-      case 'cursor_move':
-        this.trigger('client_cursor_move', { peerId: fromPeerId, data: data.payload });
-        break;
-
-      default:
-        this.trigger('client_message', { peerId: fromPeerId, data });
-        break;
-    }
-  }
-
-  // --- JOIN AN EXISTING GAME ---
+  // --- JOIN GAME ---
   joinGame(roomCode, playerInfo) {
     return new Promise((resolve, reject) => {
       this.isHost = false;
@@ -169,50 +124,51 @@ class NetworkManager {
         return reject(err);
       }
 
-      const connectionTimeout = setTimeout(() => {
-        reject(new Error('Connection timed out. Check room code or host availability.'));
+      const timer = setTimeout(() => {
+        reject(new Error('Connection timed out. Check room code.'));
       }, 12000);
 
       this.peer.on('open', (myPeerId) => {
         this.myId = myPeerId;
-        console.log(`[Client] Connecting to host: ${targetHostPeerId}`);
 
         this.hostConn = this.peer.connect(targetHostPeerId, {
           reliable: true
         });
 
         this.hostConn.on('open', () => {
-          clearTimeout(connectionTimeout);
+          clearTimeout(timer);
           this.isConnected = true;
           console.log('[Client] Connected to host!');
 
           // Send join handshake
           this.sendToHost({
-            type: 'join',
+            type: 'JOIN_REQUEST',
             player: playerInfo
           });
 
-          this.hostConn.on('data', (data) => {
-            this.handleHostMessage(data, resolve);
+          this.hostConn.on('data', (msg) => {
+            if (msg && msg.type) {
+              if (msg.type === 'JOIN_ACCEPTED' && resolve) {
+                resolve(msg.gameState);
+              }
+              this.trigger(msg.type, msg);
+            }
           });
 
           this.hostConn.on('close', () => {
-            console.warn('[Client] Lost connection to host');
             this.isConnected = false;
-            this.trigger('host_disconnected');
+            this.trigger('HOST_DISCONNECTED', {});
           });
         });
 
         this.hostConn.on('error', (err) => {
-          clearTimeout(connectionTimeout);
-          console.error('[Client] Connection error:', err);
+          clearTimeout(timer);
           reject(err);
         });
       });
 
       this.peer.on('error', (err) => {
-        clearTimeout(connectionTimeout);
-        console.error('[Client] Peer error:', err);
+        clearTimeout(timer);
         let msg = 'Failed to connect.';
         if (err.type === 'peer-unavailable') {
           msg = `Room "${this.roomCode}" not found. Verify the code with the host.`;
@@ -222,86 +178,29 @@ class NetworkManager {
     });
   }
 
-  handleHostMessage(data, resolvePromise) {
-    if (!data || !data.type) return;
-
-    switch (data.type) {
-      case 'joined_ok':
-        if (resolvePromise) resolvePromise(data.gameState);
-        this.trigger('joined_success', data.gameState);
-        break;
-
-      case 'player_joined':
-        this.trigger('player_joined', data.player);
-        break;
-
-      case 'player_left':
-        this.trigger('player_left', { peerId: data.peerId });
-        break;
-
-      case 'host_tick':
-        this.trigger('remote_host_tick', data.tick);
-        break;
-
-      case 'game_start':
-        this.trigger('game_start', data.settings);
-        break;
-
-      case 'sync_state':
-        this.trigger('sync_state', data.state);
-        break;
-
-      case 'expand_started':
-        this.trigger('remote_expand_start', data.payload);
-        break;
-
-      case 'expand_released':
-        this.trigger('remote_expand_release', data.payload);
-        break;
-
-      case 'expand_popped':
-        this.trigger('remote_expand_pop', data.payload);
-        break;
-
-      case 'territory_claimed':
-        this.trigger('remote_territory_claimed', data.payload);
-        break;
-
-      case 'game_over':
-        this.trigger('game_over', data.results);
-        break;
-
-      default:
-        this.trigger('host_message', data);
-        break;
-    }
-  }
-
   // --- SENDING METHODS ---
-
-  sendToHost(data) {
+  sendToHost(msg) {
     if (this.hostConn && this.hostConn.open) {
-      this.hostConn.send(data);
+      this.hostConn.send(msg);
     }
   }
 
-  sendTo(peerId, data) {
+  sendTo(peerId, msg) {
     const conn = this.clients.get(peerId);
     if (conn && conn.open) {
-      conn.send(data);
+      conn.send(msg);
     }
   }
 
-  broadcast(data, excludePeerId = null) {
+  broadcast(msg, excludePeerId = null) {
     for (const [peerId, conn] of this.clients.entries()) {
       if (peerId !== excludePeerId && conn.open) {
-        conn.send(data);
+        conn.send(msg);
       }
     }
   }
 
   destroy() {
-    this.stopAllExpands?.();
     if (this.hostConn) {
       try { this.hostConn.close(); } catch (e) {}
     }
