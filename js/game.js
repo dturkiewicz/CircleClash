@@ -24,6 +24,7 @@ class GameEngine {
     this.players = new Map(); // id -> Player
     this.localPlayerId = null;
     this.territories = []; // array of { id, playerId, color, x, y, r, timestamp }
+    this.tickEvents = []; // multicast events for host
     this.particles = [];
     this.ripples = [];
     this.floatingTexts = [];
@@ -206,6 +207,93 @@ class GameEngine {
     }
   }
 
+  // --- HOST MULTICAST SYSTEM ---
+  generateHostTick() {
+    const activeExpanding = [];
+    for (const p of this.players.values()) {
+      if (p.expanding) {
+        activeExpanding.push({
+          id: p.id,
+          x: Math.round(p.expanding.x),
+          y: Math.round(p.expanding.y),
+          r: Math.round(p.expanding.r)
+        });
+      }
+    }
+
+    const events = [...this.tickEvents];
+    this.tickEvents = []; // Flush events for next tick
+
+    return {
+      time: this.timeRemaining,
+      scores: this.coverageStats,
+      expanding: activeExpanding,
+      events
+    };
+  }
+
+  applyHostTick(tick) {
+    if (!tick) return;
+
+    if (typeof tick.time === 'number') {
+      this.timeRemaining = tick.time;
+    }
+    if (tick.scores) {
+      this.coverageStats = tick.scores;
+    }
+
+    // 1. Process discrete host events (claim, pop)
+    if (tick.events && Array.isArray(tick.events)) {
+      for (const ev of tick.events) {
+        if (ev.type === 'claim' && ev.territory) {
+          this.commitTerritory(ev.territory);
+        } else if (ev.type === 'pop') {
+          this.popPlayer(ev.playerId, ev.x, ev.y, ev.r);
+        }
+      }
+    }
+
+    // 2. Multicast active expanding circles
+    const activeMap = new Map();
+    if (tick.expanding && Array.isArray(tick.expanding)) {
+      for (const item of tick.expanding) {
+        activeMap.set(item.id, item);
+      }
+    }
+
+    for (const player of this.players.values()) {
+      const hostItem = activeMap.get(player.id);
+
+      if (!hostItem) {
+        // Player is NOT expanding according to host authoritative simulation
+        if (player.expanding) {
+          player.expanding = null;
+          if (window.soundManager) {
+            window.soundManager.stopExpandSound(player.id);
+          }
+        }
+      } else {
+        // Player IS expanding according to host
+        if (!player.expanding) {
+          player.expanding = {
+            x: hostItem.x,
+            y: hostItem.y,
+            r: hostItem.r,
+            maxR: this.MAX_RADIUS
+          };
+          if (window.soundManager) {
+            window.soundManager.startExpandSound(player.id);
+          }
+        } else {
+          // Smooth interpolation
+          player.expanding.r = player.expanding.r * 0.3 + hostItem.r * 0.7;
+          player.expanding.x = hostItem.x;
+          player.expanding.y = hostItem.y;
+        }
+      }
+    }
+  }
+
   releaseExpand(playerId) {
     if (this.state !== 'PLAYING') return null;
     const player = this.players.get(playerId);
@@ -245,6 +333,9 @@ class GameEngine {
         window.soundManager.playClaim(r);
       }
 
+      // Record event for host multicast
+      this.tickEvents.push({ type: 'claim', territory });
+
       return territory;
     }
     return null;
@@ -260,6 +351,9 @@ class GameEngine {
       window.soundManager.stopExpandSound(playerId);
       window.soundManager.playPop();
     }
+
+    // Record pop event for host multicast
+    this.tickEvents.push({ type: 'pop', playerId, x, y, r: radius });
 
     // Spawn sparks / pop particles
     this.createExplosion(x, y, player.color, Math.min(45, Math.max(16, radius / 3)));
@@ -739,6 +833,7 @@ class GameEngine {
 
   reset() {
     this.territories = [];
+    this.tickEvents = [];
     this.particles = [];
     this.ripples = [];
     this.floatingTexts = [];

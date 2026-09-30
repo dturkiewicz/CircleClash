@@ -128,12 +128,14 @@ class NetworkManager {
         });
         break;
 
+      case 'input_down':
       case 'start_expand':
-        this.trigger('client_start_expand', { peerId: fromPeerId, data: data.payload });
+        this.trigger('client_input_down', { peerId: fromPeerId, data: data.payload || data });
         break;
 
+      case 'input_up':
       case 'release_expand':
-        this.trigger('client_release_expand', { peerId: fromPeerId, data: data.payload });
+        this.trigger('client_input_up', { peerId: fromPeerId, data: data.payload || data });
         break;
 
       case 'cursor_move':
@@ -235,6 +237,10 @@ class NetworkManager {
 
       case 'player_left':
         this.trigger('player_left', { peerId: data.peerId });
+        break;
+
+      case 'host_tick':
+        this.trigger('remote_host_tick', data.tick);
         break;
 
       case 'game_start':

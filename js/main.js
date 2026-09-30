@@ -249,28 +249,6 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   function setupHostNetworkHandlers() {
-    // Replicate bot expansions to all connected clients
-    game.onBotExpandStart = (botId, x, y) => {
-      window.networkManager.broadcast({
-        type: 'expand_started',
-        payload: { playerId: botId, x, y }
-      });
-    };
-
-    game.onBotExpandRelease = (botId, territory) => {
-      window.networkManager.broadcast({
-        type: 'expand_released',
-        payload: { playerId: botId, territory }
-      });
-    };
-
-    game.onPlayerPopped = (playerId, x, y, r) => {
-      window.networkManager.broadcast({
-        type: 'expand_popped',
-        payload: { playerId, x, y, r }
-      });
-    };
-
     window.networkManager.on('client_join_request', ({ peerId, player, sendAccept }) => {
       player.peerId = peerId;
       game.addOrUpdatePlayer(player);
@@ -294,24 +272,14 @@ document.addEventListener('DOMContentLoaded', () => {
       refreshLobbyPlayersList();
     });
 
-    window.networkManager.on('client_start_expand', ({ peerId, data }) => {
+    // Client requests expansion start -> Host executes authoritative simulation
+    window.networkManager.on('client_input_down', ({ peerId, data }) => {
       game.startExpand(data.playerId, data.x, data.y);
-      window.networkManager.broadcast({
-        type: 'expand_started',
-        payload: data
-      }, peerId);
     });
 
-    window.networkManager.on('client_release_expand', ({ peerId, data }) => {
-      const territory = game.releaseExpand(data.playerId);
-      // Authoritatively broadcast release event to all clients
-      window.networkManager.broadcast({
-        type: 'expand_released',
-        payload: {
-          playerId: data.playerId,
-          territory: territory || null
-        }
-      });
+    // Client requests expansion release -> Host executes authoritative simulation & claims territory
+    window.networkManager.on('client_input_up', ({ peerId, data }) => {
+      game.releaseExpand(data.playerId);
     });
   }
 
@@ -385,36 +353,9 @@ document.addEventListener('DOMContentLoaded', () => {
       startMatchSequence(settings.duration);
     });
 
-    window.networkManager.on('remote_expand_start', (data) => {
-      game.startExpand(data.playerId, data.x, data.y);
-    });
-
-    window.networkManager.on('remote_expand_release', (payload) => {
-      // 1. Immediately stop expanding animation and sound
-      game.stopExpandLocally(payload.playerId);
-      // 2. Commit territory if claimed
-      if (payload.territory) {
-        game.commitTerritory(payload.territory);
-      }
-    });
-
-    window.networkManager.on('remote_expand_pop', (data) => {
-      game.popPlayer(data.playerId, data.x, data.y, data.r);
-      if (data.playerId === myPlayerId) {
-        isHolding = false;
-      }
-    });
-
-    window.networkManager.on('remote_territory_claimed', (territory) => {
-      game.commitTerritory(territory);
-    });
-
-    window.networkManager.on('sync_state', (state) => {
-      game.timeRemaining = state.timeRemaining;
-      game.coverageStats = state.coverageStats;
-      if (state.activeExpanding) {
-        game.reconcileActiveExpanding(state.activeExpanding);
-      }
+    // Authoritative Host Multicast receiver:
+    window.networkManager.on('remote_host_tick', (tick) => {
+      game.applyHostTick(tick);
       updateHudDisplay();
     });
 
@@ -493,38 +434,23 @@ document.addEventListener('DOMContentLoaded', () => {
     }, 1000);
   }
 
-  let syncInterval = null;
+  let tickInterval = null;
 
   function startHostGameTimer() {
     if (matchInterval) clearInterval(matchInterval);
-    if (syncInterval) clearInterval(syncInterval);
+    if (tickInterval) clearInterval(tickInterval);
 
-    // Fast state sync (10Hz) to keep expanding circles and coverage aligned
+    // Authoritative Host Multicast: 30 FPS tick rate
     if (!isSoloMode && window.networkManager && window.networkManager.isHost) {
-      syncInterval = setInterval(() => {
+      tickInterval = setInterval(() => {
         if (game.state !== 'PLAYING') return;
 
-        const activeExpanding = [];
-        for (const p of game.players.values()) {
-          if (p.expanding) {
-            activeExpanding.push({
-              playerId: p.id,
-              x: Math.round(p.expanding.x),
-              y: Math.round(p.expanding.y),
-              r: Math.round(p.expanding.r)
-            });
-          }
-        }
-
+        const tickData = game.generateHostTick();
         window.networkManager.broadcast({
-          type: 'sync_state',
-          state: {
-            timeRemaining: game.timeRemaining,
-            coverageStats: game.coverageStats,
-            activeExpanding
-          }
+          type: 'host_tick',
+          tick: tickData
         });
-      }, 100);
+      }, 35); // ~28-30 Hz
     }
 
     matchInterval = setInterval(() => {
@@ -535,7 +461,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
       if (game.timeRemaining <= 0) {
         clearInterval(matchInterval);
-        if (syncInterval) clearInterval(syncInterval);
+        if (tickInterval) clearInterval(tickInterval);
         game.updateCoverage();
 
         // Calculate rankings
@@ -637,7 +563,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function returnToLobby() {
     if (matchInterval) clearInterval(matchInterval);
-    if (syncInterval) clearInterval(syncInterval);
+    if (tickInterval) clearInterval(tickInterval);
     game.state = 'LOBBY';
     game.reset();
     window.soundManager.stopAllExpands();
@@ -710,20 +636,18 @@ document.addEventListener('DOMContentLoaded', () => {
     isHolding = true;
     holdVirtualPos = game.screenToVirtual(clientX, clientY);
 
-    game.startExpand(myPlayerId, holdVirtualPos.x, holdVirtualPos.y);
+    if (isSoloMode || window.networkManager.isHost) {
+      // Host or solo executes directly in local simulation
+      game.startExpand(myPlayerId, holdVirtualPos.x, holdVirtualPos.y);
+    } else {
+      // Client immediately starts local expansion for zero input lag
+      game.startExpand(myPlayerId, holdVirtualPos.x, holdVirtualPos.y);
 
-    if (!isSoloMode && window.networkManager) {
-      if (window.networkManager.isHost) {
-        window.networkManager.broadcast({
-          type: 'expand_started',
-          payload: { playerId: myPlayerId, x: holdVirtualPos.x, y: holdVirtualPos.y }
-        });
-      } else {
-        window.networkManager.sendToHost({
-          type: 'start_expand',
-          payload: { playerId: myPlayerId, x: holdVirtualPos.x, y: holdVirtualPos.y }
-        });
-      }
+      // Client forwards input to authoritative host
+      window.networkManager.sendToHost({
+        type: 'input_down',
+        data: { playerId: myPlayerId, x: holdVirtualPos.x, y: holdVirtualPos.y }
+      });
     }
   }
 
@@ -733,22 +657,17 @@ document.addEventListener('DOMContentLoaded', () => {
 
     if (game.state !== 'PLAYING') return;
 
-    if (isSoloMode) {
+    if (isSoloMode || window.networkManager.isHost) {
+      // Host or solo executes release (multicast will broadcast claim event & cleared expanding state)
       game.releaseExpand(myPlayerId);
-    } else if (window.networkManager.isHost) {
-      const territory = game.releaseExpand(myPlayerId);
-      window.networkManager.broadcast({
-        type: 'expand_released',
-        payload: { playerId: myPlayerId, territory }
-      });
     } else {
-      // Client immediately stops expanding locally
+      // Client immediately clears local expanding state & audio
       game.stopExpandLocally(myPlayerId);
 
-      // Client sends release to host for authoritative territory decision
+      // Client notifies authoritative host to release and claim territory
       window.networkManager.sendToHost({
-        type: 'release_expand',
-        payload: { playerId: myPlayerId }
+        type: 'input_up',
+        data: { playerId: myPlayerId }
       });
     }
   }
