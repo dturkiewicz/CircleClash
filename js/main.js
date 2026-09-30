@@ -36,6 +36,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const btnStartSolo = document.getElementById('btnStartSolo');
   const lobbyError = document.getElementById('lobbyError');
+  const lobbyBanner = document.getElementById('lobbyBanner');
 
   const timerText = document.getElementById('timerText');
   const hudTimer = document.getElementById('hudTimer');
@@ -431,9 +432,21 @@ document.addEventListener('DOMContentLoaded', () => {
       concludeMatch(msg.results);
     });
 
-    window.networkManager.on('HOST_DISCONNECTED', () => {
-      alert('Host disconnected from the match.');
+    function handleHostDeparture(reason) {
+      showLobbyNotice(reason);
+      if (window.networkManager) {
+        window.networkManager.destroy();
+      }
       returnToLobby();
+      switchTab('join');
+    }
+
+    window.networkManager.on('HOST_CLOSED_ROOM', (msg) => {
+      handleHostDeparture(msg.message || 'Host ended the match. Returned to main menu.');
+    });
+
+    window.networkManager.on('HOST_DISCONNECTED', (msg) => {
+      handleHostDeparture(msg.message || 'Host disconnected. Returned to main menu.');
     });
   }
 
@@ -609,10 +622,51 @@ document.addEventListener('DOMContentLoaded', () => {
     startMatchSequence(duration);
   });
 
-  btnReturnLobby.addEventListener('click', returnToLobby);
+  function showLobbyNotice(msg) {
+    if (lobbyBanner) {
+      lobbyBanner.textContent = `ℹ️ ${msg}`;
+      lobbyBanner.style.display = 'block';
+      setTimeout(() => {
+        lobbyBanner.style.display = 'none';
+      }, 7000);
+    }
+  }
+
+  btnReturnLobby.addEventListener('click', handleUserLeaveMatch);
   btnExit.addEventListener('click', () => {
     if (confirm('Leave current match and return to lobby?')) {
-      returnToLobby();
+      handleUserLeaveMatch();
+    }
+  });
+
+  function handleUserLeaveMatch() {
+    if (!isSoloMode && window.networkManager && window.networkManager.isConnected) {
+      if (window.networkManager.isHost) {
+        // Host broadcasts to all clients that room is closing
+        window.networkManager.broadcast({
+          type: 'HOST_CLOSED_ROOM',
+          message: 'The host has ended the match.'
+        });
+      }
+      setTimeout(() => {
+        if (window.networkManager) {
+          window.networkManager.destroy();
+        }
+      }, 50);
+    }
+    returnToLobby();
+  }
+
+  // Handle browser tab / window closure
+  window.addEventListener('beforeunload', () => {
+    if (!isSoloMode && window.networkManager && window.networkManager.isConnected) {
+      if (window.networkManager.isHost) {
+        window.networkManager.broadcast({
+          type: 'HOST_CLOSED_ROOM',
+          message: 'The host has left the match.'
+        });
+      }
+      window.networkManager.destroy();
     }
   });
 
@@ -621,10 +675,18 @@ document.addEventListener('DOMContentLoaded', () => {
     game.state = 'LOBBY';
     game.reset();
     window.soundManager.stopAllExpands();
+    window.isUserHolding = false;
 
     gameOverScreen.classList.add('hidden');
     gameHud.classList.add('hidden');
     lobbyScreen.classList.remove('hidden');
+
+    btnJoinRoom.disabled = false;
+    joinStatus.textContent = '';
+    btnCreateRoom.disabled = false;
+    btnCreateRoom.textContent = '⚡ Create Room';
+    hostSetupView.style.display = 'block';
+    hostLobbyView.style.display = 'none';
 
     if (isSoloMode) {
       isSoloMode = false;

@@ -156,9 +156,24 @@ class NetworkManager {
           });
 
           this.hostConn.on('close', () => {
-            this.isConnected = false;
-            this.trigger('HOST_DISCONNECTED', {});
+            if (this.isConnected) {
+              this.isConnected = false;
+              this.trigger('HOST_DISCONNECTED', { message: 'Host disconnected from the match.' });
+            }
           });
+
+          // Detect raw WebRTC disconnection immediately
+          if (this.hostConn.peerConnection) {
+            this.hostConn.peerConnection.addEventListener('connectionstatechange', () => {
+              const state = this.hostConn.peerConnection?.connectionState;
+              if (state === 'disconnected' || state === 'failed' || state === 'closed') {
+                if (this.isConnected) {
+                  this.isConnected = false;
+                  this.trigger('HOST_DISCONNECTED', { message: 'Host disconnected from the match.' });
+                }
+              }
+            });
+          }
         });
 
         this.hostConn.on('error', (err) => {
