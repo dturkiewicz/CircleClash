@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Circle Clash - Multiplayer Territory Conquest</title>
+  <link rel="stylesheet" href="css/style.css">
+  <!-- PeerJS WebRTC Library -->
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+</head>
+<body>
+
+  <!-- Game Canvas -->
+  <canvas id="gameCanvas"></canvas>
+
+  <!-- ================= IN-GAME HUD ================= -->
+  <div id="gameHud" class="hidden">
+    <div class="hud-top-bar">
+      <div class="hud-left">
+        <div id="hudTimer" class="timer-pill">
+          <span>⏱️</span>
+          <span id="timerText">01:00</span>
+        </div>
+        <div id="hudRoomBadge" class="timer-pill" style="cursor: pointer;" title="Click to copy invite link">
+          <span>🔗</span>
+          <span id="hudRoomCode">ROOM</span>
+        </div>
+      </div>
+
+      <div class="hud-right">
+        <button id="btnMute" class="icon-btn" title="Toggle Sound">🔊</button>
+        <button id="btnExit" class="icon-btn" title="Leave Match">✕</button>
+      </div>
+    </div>
+
+    <!-- Real-time Territory Progress Bar -->
+    <div class="territory-bar-container">
+      <div id="territoryBar" class="territory-bar"></div>
+      <div id="territoryLabels" class="territory-labels"></div>
+    </div>
+
+    <!-- Bottom Controls Hint -->
+    <div id="controlHint" class="control-hint">
+      Hold anywhere to expand circle • Release to claim territory • Watch out for collisions!
+    </div>
+  </div>
+
+  <!-- ================= LOBBY SCREEN ================= -->
+  <div id="lobbyScreen" class="overlay-screen">
+    <div class="lobby-container">
+      <div class="game-title">
+        <h1>CIRCLE CLASH</h1>
+        <div class="subtitle">Multiplayer Territory Conquest</div>
+      </div>
+
+      <!-- Player Setup -->
+      <div class="form-group">
+        <label for="playerNameInput">Player Name</label>
+        <input type="text" id="playerNameInput" class="text-input" maxlength="14" placeholder="Enter your name">
+      </div>
+
+      <div class="form-group">
+        <label>Your Color</label>
+        <div id="colorPicker" class="color-picker">
+          <!-- Dynamically populated colors -->
+        </div>
+      </div>
+
+      <!-- Navigation Tabs -->
+      <div class="tabs">
+        <button id="tabHost" class="tab-btn active">Host Game</button>
+        <button id="tabJoin" class="tab-btn">Join Game</button>
+        <button id="tabSolo" class="tab-btn">Solo Practice</button>
+      </div>
+
+      <!-- PANEL: HOST GAME -->
+      <div id="panelHost" class="tab-panel">
+        <div id="hostSetupView">
+          <div class="form-group">
+            <label for="matchDuration">Round Duration</label>
+            <select id="matchDuration" class="text-input" style="cursor: pointer;">
+              <option value="45">45 Seconds (Blitz)</option>
+              <option value="60" selected>60 Seconds (Standard)</option>
+              <option value="90">90 Seconds (Strategic)</option>
+            </select>
+          </div>
+          <button id="btnCreateRoom" class="btn-primary">
+            <span>⚡ Create Room</span>
+          </button>
+        </div>
+
+        <div id="hostLobbyView" style="display: none;">
+          <div class="room-code-badge">
+            <div>
+              <div style="font-size: 0.75rem; color: var(--text-muted); text-transform: uppercase;">Room Code</div>
+              <div id="displayRoomCode" class="room-code-text">-----</div>
+            </div>
+            <button id="btnCopyInvite" class="btn-copy">📋 Copy Link</button>
+          </div>
+
+          <label style="font-size: 0.85rem; color: var(--text-muted); text-transform: uppercase; margin-bottom: 6px; display: block;">
+            Connected Players (<span id="playerCount">1</span>)
+          </label>
+          <div id="lobbyPlayersList" class="lobby-players-list"></div>
+
+          <div style="display: flex; gap: 8px;">
+            <button id="btnAddBot" class="btn-secondary" style="margin-top: 0; flex: 1;">
+              🤖 Add Bot
+            </button>
+            <button id="btnStartGame" class="btn-primary" style="flex: 2;">
+              🚀 Start Match
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- PANEL: JOIN GAME -->
+      <div id="panelJoin" class="tab-panel" style="display: none;">
+        <div class="form-group">
+          <label for="roomCodeInput">Room Code</label>
+          <input type="text" id="roomCodeInput" class="text-input" maxlength="6" placeholder="e.g. 7X9KM" style="text-transform: uppercase; font-weight: 700; letter-spacing: 2px;">
+        </div>
+        <button id="btnJoinRoom" class="btn-primary">
+          <span>🎮 Connect to Room</span>
+        </button>
+        <div id="joinStatus" class="status-msg"></div>
+      </div>
+
+      <!-- PANEL: SOLO PRACTICE -->
+      <div id="panelSolo" class="tab-panel" style="display: none;">
+        <p style="font-size: 0.9rem; color: var(--text-muted); margin-bottom: 16px; line-height: 1.5;">
+          Jump straight into a single-player match against 2 AI bots to practice your timing and territory trapping!
+        </p>
+        <button id="btnStartSolo" class="btn-primary">
+          <span>⚔️ Start Practice Match</span>
+        </button>
+      </div>
+
+      <div id="lobbyError" class="status-msg" style="color: #ff3366; display: none;"></div>
+    </div>
+  </div>
+
+  <!-- ================= GAME OVER SCREEN ================= -->
+  <div id="gameOverScreen" class="overlay-screen hidden">
+    <div class="lobby-container game-over-card">
+      <div class="winner-crown">👑</div>
+      <div class="subtitle" style="letter-spacing: 3px; margin-bottom: 6px;">MATCH CONCLUDED</div>
+      <div id="winnerName" class="winner-name">Winner</div>
+      <div id="winnerScore" class="winner-score">Claimed 0% of the arena</div>
+
+      <div id="leaderboardResults" class="leaderboard-results">
+        <!-- Results rows -->
+      </div>
+
+      <button id="btnPlayAgain" class="btn-primary">
+        <span>🔄 Play Again</span>
+      </button>
+      <button id="btnReturnLobby" class="btn-secondary">
+        Return to Lobby
+      </button>
+    </div>
+  </div>
+
+  <!-- Game Scripts -->
+  <script src="js/audio.js"></script>
+  <script src="js/network.js"></script>
+  <script src="js/game.js"></script>
+  <script src="js/main.js"></script>
+</body>
+</html>

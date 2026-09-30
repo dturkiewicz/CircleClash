@@ -1,0 +1,18 @@
+{
+  "name": "circle-clash-multiplayer",
+  "version": "1.0.0",
+  "description": "Multiplayer HTML5 circle expansion and territory conquest game powered by PeerJS WebRTC",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": [
+    "html5-game",
+    "multiplayer",
+    "canvas",
+    "webrtc",
+    "peerjs"
+  ],
+  "author": "",
+  "license": "MIT"
+}
