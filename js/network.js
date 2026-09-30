@@ -249,6 +249,10 @@ class NetworkManager {
         this.trigger('remote_expand_start', data.payload);
         break;
 
+      case 'expand_released':
+        this.trigger('remote_expand_release', data.payload);
+        break;
+
       case 'expand_popped':
         this.trigger('remote_expand_pop', data.payload);
         break;

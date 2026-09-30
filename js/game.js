@@ -129,10 +129,87 @@ class GameEngine {
     }
   }
 
-  releaseExpand(playerId) {
-    if (this.state !== 'PLAYING') return;
+  stopExpandLocally(playerId) {
     const player = this.players.get(playerId);
-    if (!player || !player.expanding) return;
+    if (player) {
+      player.expanding = null;
+    }
+    if (window.soundManager) {
+      window.soundManager.stopExpandSound(playerId);
+    }
+  }
+
+  commitTerritory(territory) {
+    if (!territory) return;
+    // Prevent duplicate territory insertion
+    if (this.territories.some(t => t.id === territory.id)) return;
+
+    this.territories.push(territory);
+
+    // Make sure expanding state is cleared for the player who claimed it
+    this.stopExpandLocally(territory.playerId);
+
+    // Add shockwave ripple
+    this.ripples.push({
+      x: territory.x,
+      y: territory.y,
+      r: territory.r,
+      maxR: territory.r + 35,
+      color: territory.color,
+      alpha: 0.8
+    });
+
+    if (window.soundManager) {
+      window.soundManager.playClaim(territory.r);
+    }
+  }
+
+  reconcileActiveExpanding(activeList = []) {
+    const activeMap = new Map();
+    for (const item of activeList) {
+      activeMap.set(item.playerId, item);
+    }
+
+    for (const player of this.players.values()) {
+      const isLocal = (player.id === this.localPlayerId);
+      const hostItem = activeMap.get(player.id);
+
+      if (!hostItem) {
+        // Authoritative Host says this player is NOT expanding
+        if (!isLocal && player.expanding) {
+          player.expanding = null;
+          if (window.soundManager) {
+            window.soundManager.stopExpandSound(player.id);
+          }
+        }
+      } else {
+        // Authoritative Host says this player IS expanding
+        if (!isLocal) {
+          if (!player.expanding) {
+            player.expanding = {
+              x: hostItem.x,
+              y: hostItem.y,
+              r: hostItem.r,
+              maxR: this.MAX_RADIUS
+            };
+            if (window.soundManager) {
+              window.soundManager.startExpandSound(player.id);
+            }
+          } else {
+            // Smoothly align radius with authoritative host
+            player.expanding.r = player.expanding.r * 0.3 + hostItem.r * 0.7;
+            player.expanding.x = hostItem.x;
+            player.expanding.y = hostItem.y;
+          }
+        }
+      }
+    }
+  }
+
+  releaseExpand(playerId) {
+    if (this.state !== 'PLAYING') return null;
+    const player = this.players.get(playerId);
+    if (!player || !player.expanding) return null;
 
     const { x, y, r } = player.expanding;
     player.expanding = null;
@@ -267,6 +344,10 @@ class GameEngine {
         // Target hold duration: 0.8 to 2.2 seconds
         player.botHoldDuration = 800 + Math.random() * 1400;
         player.botExpandStartTime = now;
+
+        if (this.onBotExpandStart) {
+          this.onBotExpandStart(player.id, x, y);
+        }
       } else if (player.botState === 'GROWING' && player.expanding) {
         const elapsed = now - player.botExpandStartTime;
 
@@ -289,11 +370,8 @@ class GameEngine {
           player.botState = 'IDLE';
           player.botTimer = now + 400 + Math.random() * 1200;
 
-          if (territory && window.networkManager?.isHost) {
-            window.networkManager.broadcast({
-              type: 'territory_claimed',
-              payload: territory
-            });
+          if (this.onBotExpandRelease) {
+            this.onBotExpandRelease(player.id, territory);
           }
         }
       }
@@ -328,12 +406,8 @@ class GameEngine {
         const { x, y, r } = p.expanding;
         this.popPlayer(id, x, y, r, 'collision');
 
-        // If host, broadcast pop
-        if (window.networkManager && window.networkManager.isHost) {
-          window.networkManager.broadcast({
-            type: 'expand_popped',
-            payload: { playerId: id, x, y, r }
-          });
+        if (this.onPlayerPopped) {
+          this.onPlayerPopped(id, x, y, r);
         }
       }
     }
@@ -395,7 +469,7 @@ class GameEngine {
   startLoop() {
     if (this.rafId) cancelAnimationFrame(this.rafId);
     const loop = (now) => {
-      const dt = (now - this.lastFrameTime) / 1000;
+      const dt = Math.min(0.1, (now - this.lastFrameTime) / 1000);
       this.lastFrameTime = now;
 
       this.update(now, dt);
@@ -412,14 +486,13 @@ class GameEngine {
   }
 
   update(now, dt) {
-    // 1. Update expanding circles
+    // 1. Update expanding circles smoothly using delta time
     if (this.state === 'PLAYING') {
       for (const player of this.players.values()) {
         if (player.expanding) {
-          const elapsed = (now - player.expanding.startTime) / 1000;
           player.expanding.r = Math.min(
             player.expanding.maxR,
-            10 + elapsed * this.GROWTH_RATE
+            player.expanding.r + this.GROWTH_RATE * dt
           );
         }
       }

@@ -249,6 +249,28 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   function setupHostNetworkHandlers() {
+    // Replicate bot expansions to all connected clients
+    game.onBotExpandStart = (botId, x, y) => {
+      window.networkManager.broadcast({
+        type: 'expand_started',
+        payload: { playerId: botId, x, y }
+      });
+    };
+
+    game.onBotExpandRelease = (botId, territory) => {
+      window.networkManager.broadcast({
+        type: 'expand_released',
+        payload: { playerId: botId, territory }
+      });
+    };
+
+    game.onPlayerPopped = (playerId, x, y, r) => {
+      window.networkManager.broadcast({
+        type: 'expand_popped',
+        payload: { playerId, x, y, r }
+      });
+    };
+
     window.networkManager.on('client_join_request', ({ peerId, player, sendAccept }) => {
       player.peerId = peerId;
       game.addOrUpdatePlayer(player);
@@ -264,6 +286,7 @@ document.addEventListener('DOMContentLoaded', () => {
     window.networkManager.on('player_disconnected', ({ peerId }) => {
       for (const [id, p] of game.players.entries()) {
         if (p.peerId === peerId) {
+          game.stopExpandLocally(id);
           game.removePlayer(id);
           break;
         }
@@ -281,12 +304,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
     window.networkManager.on('client_release_expand', ({ peerId, data }) => {
       const territory = game.releaseExpand(data.playerId);
-      if (territory) {
-        window.networkManager.broadcast({
-          type: 'territory_claimed',
-          payload: territory
-        });
-      }
+      // Authoritatively broadcast release event to all clients
+      window.networkManager.broadcast({
+        type: 'expand_released',
+        payload: {
+          playerId: data.playerId,
+          territory: territory || null
+        }
+      });
     });
   }
 
@@ -349,6 +374,7 @@ document.addEventListener('DOMContentLoaded', () => {
     window.networkManager.on('player_left', ({ peerId }) => {
       for (const [id, p] of game.players.entries()) {
         if (p.peerId === peerId) {
+          game.stopExpandLocally(id);
           game.removePlayer(id);
           break;
         }
@@ -363,26 +389,32 @@ document.addEventListener('DOMContentLoaded', () => {
       game.startExpand(data.playerId, data.x, data.y);
     });
 
+    window.networkManager.on('remote_expand_release', (payload) => {
+      // 1. Immediately stop expanding animation and sound
+      game.stopExpandLocally(payload.playerId);
+      // 2. Commit territory if claimed
+      if (payload.territory) {
+        game.commitTerritory(payload.territory);
+      }
+    });
+
     window.networkManager.on('remote_expand_pop', (data) => {
       game.popPlayer(data.playerId, data.x, data.y, data.r);
+      if (data.playerId === myPlayerId) {
+        isHolding = false;
+      }
     });
 
     window.networkManager.on('remote_territory_claimed', (territory) => {
-      game.territories.push(territory);
-      game.ripples.push({
-        x: territory.x,
-        y: territory.y,
-        r: territory.r,
-        maxR: territory.r + 35,
-        color: territory.color,
-        alpha: 0.8
-      });
-      window.soundManager.playClaim(territory.r);
+      game.commitTerritory(territory);
     });
 
     window.networkManager.on('sync_state', (state) => {
       game.timeRemaining = state.timeRemaining;
       game.coverageStats = state.coverageStats;
+      if (state.activeExpanding) {
+        game.reconcileActiveExpanding(state.activeExpanding);
+      }
       updateHudDisplay();
     });
 
@@ -461,8 +493,39 @@ document.addEventListener('DOMContentLoaded', () => {
     }, 1000);
   }
 
+  let syncInterval = null;
+
   function startHostGameTimer() {
     if (matchInterval) clearInterval(matchInterval);
+    if (syncInterval) clearInterval(syncInterval);
+
+    // Fast state sync (10Hz) to keep expanding circles and coverage aligned
+    if (!isSoloMode && window.networkManager && window.networkManager.isHost) {
+      syncInterval = setInterval(() => {
+        if (game.state !== 'PLAYING') return;
+
+        const activeExpanding = [];
+        for (const p of game.players.values()) {
+          if (p.expanding) {
+            activeExpanding.push({
+              playerId: p.id,
+              x: Math.round(p.expanding.x),
+              y: Math.round(p.expanding.y),
+              r: Math.round(p.expanding.r)
+            });
+          }
+        }
+
+        window.networkManager.broadcast({
+          type: 'sync_state',
+          state: {
+            timeRemaining: game.timeRemaining,
+            coverageStats: game.coverageStats,
+            activeExpanding
+          }
+        });
+      }, 100);
+    }
 
     matchInterval = setInterval(() => {
       if (game.state !== 'PLAYING') return;
@@ -470,19 +533,9 @@ document.addEventListener('DOMContentLoaded', () => {
       game.timeRemaining--;
       updateHudDisplay();
 
-      // Host broadcasts state sync every second
-      if (!isSoloMode && window.networkManager && window.networkManager.isHost) {
-        window.networkManager.broadcast({
-          type: 'sync_state',
-          state: {
-            timeRemaining: game.timeRemaining,
-            coverageStats: game.coverageStats
-          }
-        });
-      }
-
       if (game.timeRemaining <= 0) {
         clearInterval(matchInterval);
+        if (syncInterval) clearInterval(syncInterval);
         game.updateCoverage();
 
         // Calculate rankings
@@ -518,6 +571,7 @@ document.addEventListener('DOMContentLoaded', () => {
   function concludeMatch(rankings) {
     game.state = 'GAME_OVER';
     if (matchInterval) clearInterval(matchInterval);
+    if (syncInterval) clearInterval(syncInterval);
     window.soundManager.stopAllExpands();
     window.soundManager.playVictory();
 
@@ -583,6 +637,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function returnToLobby() {
     if (matchInterval) clearInterval(matchInterval);
+    if (syncInterval) clearInterval(syncInterval);
     game.state = 'LOBBY';
     game.reset();
     window.soundManager.stopAllExpands();
@@ -678,22 +733,23 @@ document.addEventListener('DOMContentLoaded', () => {
 
     if (game.state !== 'PLAYING') return;
 
-    if (isSoloMode || window.networkManager.isHost) {
+    if (isSoloMode) {
+      game.releaseExpand(myPlayerId);
+    } else if (window.networkManager.isHost) {
       const territory = game.releaseExpand(myPlayerId);
-      if (territory && !isSoloMode) {
-        window.networkManager.broadcast({
-          type: 'territory_claimed',
-          payload: territory
-        });
-      }
+      window.networkManager.broadcast({
+        type: 'expand_released',
+        payload: { playerId: myPlayerId, territory }
+      });
     } else {
-      // Client notifies host
+      // Client immediately stops expanding locally
+      game.stopExpandLocally(myPlayerId);
+
+      // Client sends release to host for authoritative territory decision
       window.networkManager.sendToHost({
         type: 'release_expand',
         payload: { playerId: myPlayerId }
       });
-      // Client stops local sound immediately for crisp responsiveness
-      window.soundManager.stopExpandSound(myPlayerId);
     }
   }
 
